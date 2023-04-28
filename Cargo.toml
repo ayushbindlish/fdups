@@ -7,5 +7,8 @@ edition = "2021"
 
 [dependencies]
 walkdir = "2.3"
-rust-crypto = "0.2.36"
+rust-crypto = "0.2"
 rayon = "1.7.0"
+ignore = "0.4.20"
+lru = "0.10.0"
+#crypto = { version = "0.5.0", features = ["digest", "aead", "cipher", "digest", "getrandom", "password-hash", "rand_core", "signature", "std", "universal-hash"] }
