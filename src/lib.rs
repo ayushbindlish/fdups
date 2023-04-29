@@ -1,4 +1,9 @@
 // src/lib.rs
+use crypto::digest::Digest;
+use crypto::sha2::Sha256;
+use ignore::WalkBuilder;
+use lru::LruCache;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, metadata, File};
@@ -10,18 +15,15 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use crypto::digest::Digest;
-use crypto::sha2::Sha256;
-use ignore::WalkBuilder;
-use rayon::prelude::*;
-
-use lru::LruCache;
-
+// Define the type for the data sent through the channel
 type ChannelData = (String, PathBuf);
 
+// The main function for removing duplicates
 pub fn remove_duplicates(path: &str, delete: bool) -> Result<(usize, usize), Box<dyn Error>> {
+    // Set cache size for LRU cache
     let cache_size: NonZeroUsize = NonZeroUsize::new(16384).unwrap();
 
+    // Create a HashMap to store files grouped by size
     let mut files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new(); // Create a hash map to store files grouped by size
 
     // Use WalkBuilder to create a directory iterator that respects .gitignore files
@@ -31,40 +33,47 @@ pub fn remove_duplicates(path: &str, delete: bool) -> Result<(usize, usize), Box
         .git_exclude(true)
         .build();
 
+    // Iterate through the directory tree, filtering out files and directories specified in .gitignore
     for entry in walker
         .filter_map(Result::ok)
         .filter(|e| e.file_type().unwrap().is_file())
     {
-        // Walk the directory tree, ignoring files and directories specified in .gitignore
         let size = entry.metadata()?.len(); // Get the file size
+        // Get or create a vector of files with this size
         let file_list = files_by_size.entry(size).or_insert_with(Vec::new); // Get or create a vector of files with this size
         file_list.push(entry.path().to_owned()); // Add the file path to the vector
     }
 
     let mut potential_duplicates: Vec<PathBuf> = Vec::new(); // Create a vector to store potential duplicate files
 
+    // Iterate through the files grouped by size
     for (_, files) in files_by_size {
         // For each size of files
         if files.len() > 1 {
-            // If there's more than one file with this size
-            potential_duplicates.extend(files); // Add all files to the potential duplicates vector
+            // If there's more than one file with this size, add all files to the potential duplicates vector
+            potential_duplicates.extend(files);
         }
     }
 
     let mut duplicates: HashMap<String, Vec<PathBuf>> = HashMap::new(); // Create a hash map to store duplicates grouped by hash
+
     let hasher_cache: Arc<Mutex<LruCache<PathBuf, String>>> =
-        Arc::new(Mutex::new(LruCache::new(cache_size)));
+        Arc::new(Mutex::new(LruCache::new(cache_size))); // Create an LRU cache to store file hashes
 
     let (tx, rx): (Sender<ChannelData>, Receiver<ChannelData>) = channel(); // Create a message passing channel to send hashes and file paths between threads
 
+    // Iterate through potential duplicates in parallel
     potential_duplicates
         .into_par_iter()
         .for_each_with(tx.clone(), |tx, file_path| {
-            let hasher_cache = Arc::clone(&hasher_cache);
+            let hasher_cache = Arc::clone(&hasher_cache); // Clone and lock the hasher cache
             let mut hasher_cache = hasher_cache.lock().unwrap();
+            // If the hash is already in the cache, send it through the channel
             if let Some(cached_hash) = hasher_cache.get(&file_path) {
                 tx.send((cached_hash.clone(), file_path)).unwrap();
-            } else if let Ok(hash) = hash_file(&file_path) {
+            }
+            // Otherwise, hash the file and add it to the cache
+            else if let Ok(hash) = hash_file(&file_path) {
                 hasher_cache.put(file_path.clone(), hash.clone());
                 tx.send((hash, file_path)).unwrap(); // Send the hash and file path to the receiver
             }
@@ -126,7 +135,7 @@ pub fn remove_duplicates(path: &str, delete: bool) -> Result<(usize, usize), Box
 fn hash_file(file_path: &PathBuf) -> io::Result<String> {
     let mut file = File::open(file_path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0; 8192];
+    let mut buffer = [0; 8192]; // Setting chunk size to 8192 seems most optimal for all sizes - arrived at this number by experimentation
 
     loop {
         let bytes_read = file.read(&mut buffer)?;
