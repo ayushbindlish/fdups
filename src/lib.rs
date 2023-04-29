@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, metadata, File};
+use std::io::BufReader;
 use std::io::{self, Read};
 use std::num::NonZeroUsize;
 #[cfg(unix)]
@@ -15,10 +16,31 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-// Define the type for the data sent through the channel
+/// Define the type for the data sent through the channel
 type ChannelData = (String, PathBuf);
 
-// The main function for removing duplicates
+/// Removes duplicate files in a directory tree.
+///
+/// # Arguments
+///
+/// * `path` - The path to the directory to search for duplicates in.
+/// * `delete` - Whether or not to delete duplicate files automatically.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if any file cannot be opened, read, or deleted, or a `Box<dyn Error>`
+/// if any other error occurs.
+///
+/// # Examples
+///
+/// ```no_run
+/// use fdups::remove_duplicates;
+///
+/// let path = "/path/to/directory";
+/// let (duplicate_count, size_saved) = remove_duplicates(path, true)?;
+///
+/// println!("Found {} duplicates, saved {} bytes by deleting them", duplicate_count, size_saved);
+/// ```
 pub fn remove_duplicates(path: &str, delete: bool) -> Result<(usize, usize), Box<dyn Error>> {
     // Set cache size for LRU cache
     let cache_size: NonZeroUsize = NonZeroUsize::new(16384).unwrap();
@@ -39,7 +61,7 @@ pub fn remove_duplicates(path: &str, delete: bool) -> Result<(usize, usize), Box
         .filter(|e| e.file_type().unwrap().is_file())
     {
         let size = entry.metadata()?.len(); // Get the file size
-        // Get or create a vector of files with this size
+                                            // Get or create a vector of files with this size
         let file_list = files_by_size.entry(size).or_insert_with(Vec::new); // Get or create a vector of files with this size
         file_list.push(entry.path().to_owned()); // Add the file path to the vector
     }
@@ -132,13 +154,43 @@ pub fn remove_duplicates(path: &str, delete: bool) -> Result<(usize, usize), Box
     Ok((duplicate_count, size_saved))
 }
 
-fn hash_file(file_path: &PathBuf) -> io::Result<String> {
-    let mut file = File::open(file_path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 8192]; // Setting chunk size to 8192 seems most optimal for all sizes - arrived at this number by experimentation
+/// Use a constant for buffer size, making it easier to modify if needed
+const BUFFER_SIZE: usize = 8192;
 
+/// Computes the SHA256 hash of a file.
+///
+/// # Arguments
+///
+/// * `file_path` - The path to the file to hash.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if the file cannot be opened or read.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::path::PathBuf;
+/// use hash_file::hash_file;
+///
+/// let file_path = PathBuf::from("path/to/file");
+/// let hash_result = hash_file(&file_path);
+/// match hash_result {
+///     Ok(hash) => println!("Hash of file {}: {}", file_path.display(), hash),
+///     Err(e) => eprintln!("Error hashing file {}: {}", file_path.display(), e),
+/// }
+/// ```
+fn hash_file(file_path: &PathBuf) -> io::Result<String> {
+    // Open the file with a buffered reader for improved performance
+    let file = File::open(file_path)?;
+    let mut reader = BufReader::new(file);
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; BUFFER_SIZE];
+
+    // Read the file in chunks, updating the hash with each chunk
     loop {
-        let bytes_read = file.read(&mut buffer)?;
+        let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
