@@ -1,7 +1,7 @@
 [package]
 name = "fdups"
 description = "Utility for finding and removing duplicate files, fast."
-version = "0.2.0-dev"
+version = "0.2.1-dev"
 edition = "2021"
 authors = ["Ayush Bindlish <email@ayushbindlish.com>"]
 license = "MIT OR Apache-2.0"
