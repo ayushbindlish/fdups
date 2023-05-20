@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/ayushbindlish/fdups.git"
 keywords = ["command-line", "library", "find_duplicates"]
-categories = ["command-line-utilities", "utilities", "development-tools"]
+categories = ["command-line-utilities", "development-tools"]
 
 
 [dependencies]
