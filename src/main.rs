@@ -28,7 +28,7 @@
 use std::env;
 use std::error::Error;
 
-use fdups::remove_duplicates;
+use fdups::find_remove_duplicates;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
@@ -37,10 +37,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The first argument is the directory path
     let path = args.get(1).expect("Missing directory argument");
 
-    let (duplicate_count, total_file_size, size_saved) = remove_duplicates(path, delete)?;
+    let (total_files, duplicate_count, total_file_size, size_saved) =
+        find_remove_duplicates(path, delete)?;
 
-    println!("\n{} duplicates found.", duplicate_count);
-    println!("{} bytes in total.", total_file_size);
-    println!("{} bytes saved by deleting duplicates.", size_saved);
+    println!("\n{total_files} total files found.");
+    println!("\n{duplicate_count} duplicates found.");
+    println!("{total_file_size} bytes in total.");
+    println!("{size_saved} bytes saved by deleting duplicates.");
+
     Ok(())
 }

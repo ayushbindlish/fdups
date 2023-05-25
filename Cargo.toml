@@ -1,20 +1,26 @@
 [package]
 name = "fdups"
 description = "Utility for finding and removing duplicate files, fast."
-version = "0.1.0"
+version = "0.2.1-dev"
 edition = "2021"
 authors = ["Ayush Bindlish <email@ayushbindlish.com>"]
 license = "MIT OR Apache-2.0"
-readme="README.md"
-repository="https://github.com/ayushbindlish/fdups.git"
+readme = "README.md"
+repository = "https://github.com/ayushbindlish/fdups.git"
 keywords = ["command-line", "library", "find_duplicates"]
+categories = ["command-line-utilities", "development-tools"]
 
 
 [dependencies]
-rust-crypto = "0.2"
 rayon = "1.7"
 ignore = "0.4"
-lru = "0.10"
-blake2 = "0.10.6"
-generic-array = "0.14.7"
-dashmap = "5.4.0"
+blake2 = "0.10"
+generic-array = "0.14"
+dashmap = "5.4"
+log = "0.4"
+env_logger = "0.10"
+term_size = "0.3"
+human_bytes = { version = "0.4", default-features = false, features = ["fast"] }
+clap = "4.2"
+anyhow = "1.0"
+thiserror = "1.0"
