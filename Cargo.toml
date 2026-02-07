@@ -32,7 +32,7 @@ libc = "0.2"
 redb = "2.1"
 nix = { version = "0.27", features = ["fs", "ioctl"] }
 reflink = "0.1"
-lasso = "0.7"
+lasso = { version = "0.7", features = ["multi-threaded"] }
 cuckoofilter = "0.5"
 rio = "0.9"
 

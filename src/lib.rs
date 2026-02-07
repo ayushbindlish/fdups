@@ -20,11 +20,13 @@ use env_logger::*;
 use human_bytes::human_bytes;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
+use lasso::{Rodeo, Spur, ThreadedRodeo};
 use log::*;
 use rayon::prelude::*;
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use term_size::dimensions;
 use thiserror::Error;
 
@@ -97,13 +99,41 @@ pub struct DuplicateReport {
     pub size_saved_bytes: u128,
 }
 
-#[derive(Debug, Serialize, Clone)]
+// Global path interner (Lasso)
+static INTERNER: OnceLock<ThreadedRodeo> = OnceLock::new();
+
+fn get_interner() -> &'static ThreadedRodeo {
+    INTERNER.get_or_init(ThreadedRodeo::new)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileEntry {
-    pub path: PathBuf,
+    pub path_spur: Spur,
     pub size: u64,
     pub mtime: std::time::SystemTime,
     pub dev: u64,
     pub ino: u64,
+}
+
+impl FileEntry {
+    pub fn new(path: PathBuf, size: u64, mtime: std::time::SystemTime, dev: u64, ino: u64) -> Self {
+        let interner = get_interner();
+        let path_str = path.to_string_lossy();
+        let spur = interner.get_or_intern(&path_str);
+        Self {
+            path_spur: spur,
+            size,
+            mtime,
+            dev,
+            ino,
+        }
+    }
+
+    pub fn path(&self) -> &'static std::path::Path {
+        let interner = get_interner();
+        let s = interner.resolve(&self.path_spur);
+        std::path::Path::new(s)
+    }
 }
 
 const CACHE_TABLE: TableDefinition<(u64, u64), (u64, u32, u64, &str)> =
@@ -300,7 +330,7 @@ pub fn find_duplicates_with_hasher_cache(
         if is_shutdown() {
             return;
         }
-        if let Ok(hash) = partial_hash_file(&file_entry.path) {
+        if let Ok(hash) = partial_hash_file(file_entry.path()) {
             partial_groups
                 .entry(hash)
                 .or_insert_with(Vec::new)
@@ -331,7 +361,10 @@ pub fn find_duplicates_with_hasher_cache(
                     if is_shutdown() {
                         return;
                     }
-                    if let Ok(hash) = tail_hash_file(&file_entry.path) {
+                    if is_shutdown() {
+                        return;
+                    }
+                    if let Ok(hash) = tail_hash_file(file_entry.path()) {
                         tail_map
                             .entry(hash)
                             .or_insert_with(Vec::new)
@@ -373,7 +406,7 @@ pub fn find_duplicates_with_hasher_cache(
 }
 
 /// Create a partial_hash_file function (Head Hash, 4KB)
-pub fn partial_hash_file(file_path: &PathBuf) -> io::Result<String> {
+pub fn partial_hash_file(file_path: &std::path::Path) -> io::Result<String> {
     let mut file = File::open(file_path)?;
     let mut buffer = [0; 4096];
     let n = file.read(&mut buffer)?;
@@ -381,7 +414,7 @@ pub fn partial_hash_file(file_path: &PathBuf) -> io::Result<String> {
 }
 
 /// Create a tail_hash_file function (Tail Hash, 4KB)
-pub fn tail_hash_file(file_path: &PathBuf) -> io::Result<String> {
+pub fn tail_hash_file(file_path: &std::path::Path) -> io::Result<String> {
     let mut file = File::open(file_path)?;
     let len = file.metadata()?.len();
     if len <= 4096 {
@@ -475,11 +508,16 @@ pub fn group_files_by_size(
                     .modified()
                     .unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
                 total_size_in_bytes += size as u128;
+                
+                // Intern the path
+                let path_str = path.to_string_lossy();
+                let spur = get_interner().get_or_intern(&path_str);
+
                 group_files_by_size
                     .entry(size)
                     .or_insert_with(Vec::new)
                     .push(FileEntry {
-                        path,
+                        path_spur: spur,
                         size,
                         mtime,
                         dev,
@@ -499,11 +537,16 @@ pub fn group_files_by_size(
                     .modified()
                     .unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
                 total_size_in_bytes += size as u128;
+
+                // Intern the path
+                let path_str = path.to_string_lossy();
+                let spur = get_interner().get_or_intern(&path_str);
+
                 group_files_by_size
                     .entry(size)
                     .or_insert_with(Vec::new)
                     .push(FileEntry {
-                        path,
+                        path_spur: spur,
                         size,
                         mtime,
                         dev: 0,
@@ -534,8 +577,8 @@ pub fn group_files_by_size(
 /// let mut files_by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
 /// let now = std::time::SystemTime::now();
 /// files_by_size.insert(100, vec![
-///     FileEntry { path: PathBuf::from("file1.txt"), size: 100, mtime: now, dev: 0, ino: 0 },
-///     FileEntry { path: PathBuf::from("file2.txt"), size: 100, mtime: now, dev: 0, ino: 0 }
+///     FileEntry::new(PathBuf::from("file1.txt"), 100, now, 0, 0),
+///     FileEntry::new(PathBuf::from("file2.txt"), 100, now, 0, 0)
 /// ]);
 /// let potential = find_potential_duplicates(files_by_size);
 /// assert_eq!(potential.len(), 2);
@@ -592,8 +635,8 @@ macro_rules! print_filepath {
 ///     use fdups::{process_duplicates, FileEntry};
 ///     let mut files = Vec::new();
 ///     let now = std::time::SystemTime::now();
-///     files.push(FileEntry { path: PathBuf::from("file1.txt"), size: 10, mtime: now, dev: 0, ino: 0 });
-///     files.push(FileEntry { path: PathBuf::from("file2.txt"), size: 10, mtime: now, dev: 0, ino: 0 });
+///     files.push(FileEntry::new(PathBuf::from("file1.txt"), 10, now, 0, 0));
+///     files.push(FileEntry::new(PathBuf::from("file2.txt"), 10, now, 0, 0));
 ///     let mut duplicates = HashMap::new();
 ///     duplicates.insert("hash1".to_string(), files);
 ///     let (count, size) = process_duplicates(duplicates, false, false, false)?;
@@ -618,7 +661,7 @@ pub fn process_duplicates(
             // Sort files by creation time (oldest first)
             files.sort_by_key(|file| {
                 // Get the file's metadata to determine its creation time
-                let metadata = metadata(&file.path).unwrap();
+                let metadata = metadata(file.path()).unwrap();
                 metadata
                     .created()
                     .unwrap_or_else(|_| metadata.modified().unwrap())
@@ -630,10 +673,10 @@ pub fn process_duplicates(
                 }
                 if i == 0 {
                     // If this is the first file, print that it is the original
-                    print_filepath!(entry.path, original);
+                    print_filepath!(entry.path(), original);
                 } else {
                     // Liveness check: ensure file hasn't changed since initial scan
-                    match metadata(&entry.path) {
+                    match metadata(entry.path()) {
                         Ok(current_meta) => {
                             let current_mtime = current_meta
                                 .modified()
@@ -641,7 +684,7 @@ pub fn process_duplicates(
                             if current_meta.len() != entry.size || current_mtime != entry.mtime {
                                 warn!(
                                     "File {} changed since scan, skipping for safety.",
-                                    entry.path.display()
+                                    entry.path().display()
                                 );
                                 continue;
                             }
@@ -649,7 +692,7 @@ pub fn process_duplicates(
                         Err(e) => {
                             warn!(
                                 "Could not verify liveness for {}, skipping: {}",
-                                entry.path.display(),
+                                entry.path().display(),
                                 e
                             );
                             continue;
@@ -658,16 +701,16 @@ pub fn process_duplicates(
 
                     // If reflink is requested, try to reflink from the original
                     if reflink_requested && !dry_run {
-                        let original_path = &files[0].path;
-                        match reflink::reflink(original_path, &entry.path) {
+                        let original_path = files[0].path();
+                        match reflink::reflink(original_path, entry.path()) {
                             Ok(_) => {
-                                print_filepath!(entry.path, reflinked);
+                                print_filepath!(entry.path(), reflinked);
                                 duplicate_count += 1;
                                 size_saved += entry.size as u128;
                                 continue;
                             }
                             Err(e) => {
-                                warn!("Reflink failed for {}: {}. Falling back to default behavior.", entry.path.display(), e);
+                                warn!("Reflink failed for {}: {}. Falling back to default behavior.", entry.path().display(), e);
                             }
                         }
                     }
@@ -678,22 +721,22 @@ pub fn process_duplicates(
                     // If delete is true, delete the file
                     if delete {
                         if dry_run {
-                            print_filepath!(entry.path, dry_run);
+                            print_filepath!(entry.path(), dry_run);
                         } else {
                             #[cfg(unix)]
                             {
                                 // If the OS is Unix, set the file permissions to read-only before deleting
-                                let mut permissions = metadata(&entry.path)?.permissions();
+                                let mut permissions = metadata(entry.path())?.permissions();
                                 permissions.set_mode(0o644);
-                                fs::set_permissions(&entry.path, permissions)?;
+                                fs::set_permissions(entry.path(), permissions)?;
                             }
-                            fs::remove_file(&entry.path)?;
+                            fs::remove_file(entry.path())?;
                             // print that it's deleted
-                            print_filepath!(entry.path, deleted);
+                            print_filepath!(entry.path(), deleted);
                         }
                     } else {
                         // Otherwise, print that it's a duplicate
-                        print_filepath!(entry.path, duplicate);
+                        print_filepath!(entry.path(), duplicate);
                     }
                 }
             }
@@ -736,7 +779,7 @@ pub fn full_hash_file(entry: &FileEntry, cache: Option<&SignatureCache>) -> io::
         }
     }
 
-    let file = File::open(&entry.path)?;
+    let file = File::open(entry.path())?;
     let meta = file.metadata()?;
     let len = meta.len();
 
@@ -847,7 +890,7 @@ fn hash_sparse_file(file: &File, hasher: &mut blake3::Hasher) -> io::Result<Stri
 // ============================================================================
 
 #[cfg(target_os = "linux")]
-fn get_physical_offset(path: &PathBuf) -> Option<u64> {
+fn get_physical_offset(path: &std::path::Path) -> Option<u64> {
     use ioctl::{fiemap, Fiemap, FiemapExtent};
     
     // Open file securely
@@ -881,7 +924,7 @@ fn get_physical_offset(path: &PathBuf) -> Option<u64> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn get_physical_offset(_path: &PathBuf) -> Option<u64> {
+fn get_physical_offset(_path: &std::path::Path) -> Option<u64> {
     None
 }
 
@@ -894,7 +937,7 @@ fn sort_by_physical_location(entries: &mut Vec<FileEntry>) {
         .par_iter()
         .enumerate()
         .map(|(i, entry)| {
-            (get_physical_offset(&entry.path).unwrap_or(u64::MAX), i)
+            (get_physical_offset(entry.path()).unwrap_or(u64::MAX), i)
         })
         .collect();
 
@@ -947,13 +990,13 @@ mod tests {
         #[cfg(not(unix))]
         let (dev, ino) = (0, 0);
 
-        FileEntry {
+        FileEntry::new(
             path,
-            size: meta.len(),
-            mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            meta.len(),
+            meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             dev,
             ino,
-        }
+        )
     }
 
     /// Creates a file with deterministic content of specified size
@@ -1182,20 +1225,20 @@ mod tests {
         files_by_size.insert(
             200,
             vec![
-                FileEntry {
-                    path: dup1.clone(),
-                    size: 200,
-                    mtime: std::time::SystemTime::now(),
-                    dev: 0,
-                    ino: 0,
-                },
-                FileEntry {
-                    path: dup2.clone(),
-                    size: 200,
-                    mtime: std::time::SystemTime::now(),
-                    dev: 0,
-                    ino: 0,
-                },
+                FileEntry::new(
+                    dup1.clone(),
+                    200,
+                    std::time::SystemTime::now(),
+                    0,
+                    0,
+                ),
+                FileEntry::new(
+                    dup2.clone(),
+                    200,
+                    std::time::SystemTime::now(),
+                    0,
+                    0,
+                ),
             ],
         );
 
@@ -1224,13 +1267,13 @@ mod tests {
             let path = PathBuf::from(format!("/path/file{}.txt", i));
             files_by_size.insert(
                 i as u64 * 100,
-                vec![FileEntry {
+                vec![FileEntry::new(
                     path,
-                    size: i as u64 * 100,
-                    mtime: std::time::SystemTime::now(),
-                    dev: 0,
-                    ino: 0,
-                }],
+                    i as u64 * 100,
+                    std::time::SystemTime::now(),
+                    0,
+                    0,
+                )],
             );
         }
 

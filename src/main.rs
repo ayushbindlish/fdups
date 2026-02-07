@@ -27,7 +27,6 @@
 
 use clap::Parser;
 use env_logger::{Builder, Env};
-use log::LevelFilter;
 
 use fdups::find_remove_duplicates;
 
