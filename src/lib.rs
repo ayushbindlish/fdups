@@ -64,9 +64,10 @@ pub fn find_remove_duplicates(
     let filter_level = env::var("FDUPS_LOG").unwrap_or_else(|_| "error".to_owned());
 
     // Initialize the logging system from environment
+    // Using try_init() instead of init() to avoid panic if logger is already initialized
     let mut builder = Builder::new();
     builder.filter_module("fdups", filter_level.parse::<LevelFilter>()?);
-    builder.init();
+    let _ = builder.try_init(); // Ignore error if logger already initialized
 
     debug!("Grouping files by size");
     let (files_by_size, total_files, total_file_sizes_in_bytes) =
