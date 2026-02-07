@@ -74,28 +74,16 @@ pub const PARTIAL_HASH_SIZE: usize = 512;
 /// use fdups::find_remove_duplicates;
 ///
 /// let path = "/path/to/directory";
-/// let report = find_remove_duplicates(path, true).unwrap();
+/// let report = find_remove_duplicates(path, true, false).unwrap();
 ///
 /// println!("Found {} duplicates, saved {} bytes by deleting them", report.duplicate_count, report.size_saved_bytes);
 /// ```
+#[allow(deprecated)]
 pub fn find_remove_duplicates(
     path: &str,
     delete: bool,
+    dry_run: bool,
 ) -> Result<DuplicateReport, FdupsError> {
-    // Read the logging level from the RUST_LOG environment variable or set error as default
-    let filter_level = env::var("FDUPS_LOG").unwrap_or_else(|_| "error".to_owned());
-
-    // Initialize the logging system from environment
-    // Using try_init() instead of init() to avoid panic if logger is already initialized
-    let mut builder = Builder::new();
-    builder.filter_module(
-        "fdups",
-        filter_level
-            .parse::<LevelFilter>()
-            .map_err(|e| FdupsError::Config(e.to_string()))?,
-    );
-    let _ = builder.try_init(); // Ignore error if logger already initialized
-
     debug!("Grouping files by size");
     let (files_by_size, total_files, total_file_sizes_in_bytes) =
         group_files_by_size(path, true, true, true, true)?;
@@ -107,7 +95,7 @@ pub fn find_remove_duplicates(
     let duplicates = find_duplicates_with_hasher_cache(potential_duplicates)?;
     // find duplicates
     debug!("Processing duplicates");
-    let (duplicate_count, size_saved) = process_duplicates(duplicates, delete)?;
+    let (duplicate_count, size_saved) = process_duplicates(duplicates, delete, dry_run)?;
     // process duplicates
     info!(
         "Duplicate Ratio: {}/{} ({:.2}%)",
@@ -363,6 +351,9 @@ macro_rules! print_filepath {
     ( $arg:expr,deleted ) => {{
         println!("\t- {} [Deleted]", $arg.display());
     }};
+    ( $arg:expr,dry_run ) => {{
+        println!("\t- {} [Deleted] [Dry Run]", $arg.display());
+    }};
 }
 /// Processes the detected duplicates and removes them if delete flag is set.
 ///
@@ -387,7 +378,7 @@ macro_rules! print_filepath {
 /// files.push(PathBuf::from("file2.txt"));
 /// let mut duplicates = HashMap::new();
 /// duplicates.insert("hash1".to_string(), files);
-/// let (count, size) = process_duplicates(duplicates, false)?;
+/// let (count, size) = process_duplicates(duplicates, false, false)?;
 /// assert_eq!(count, 1);
 /// assert!(size > 0);
 /// Ok(())
@@ -396,6 +387,7 @@ macro_rules! print_filepath {
 pub fn process_duplicates(
     duplicates: HashMap<String, Vec<PathBuf>>,
     delete: bool,
+    dry_run: bool,
 ) -> Result<(u128, u128), FdupsError> {
     // Define variables to keep track of the number of duplicates and amount of disk space saved
     let mut duplicate_count: u128 = 0;
@@ -426,16 +418,20 @@ pub fn process_duplicates(
                     size_saved += file_size;
                     // If delete is true, delete the file
                     if delete {
-                        #[cfg(unix)]
-                        {
-                            // If the OS is Unix, set the file permissions to read-only before deleting
-                            let mut permissions = metadata(file)?.permissions();
-                            permissions.set_mode(0o644);
-                            fs::set_permissions(file, permissions)?;
+                        if dry_run {
+                            print_filepath!(file, dry_run);
+                        } else {
+                            #[cfg(unix)]
+                            {
+                                // If the OS is Unix, set the file permissions to read-only before deleting
+                                let mut permissions = metadata(file)?.permissions();
+                                permissions.set_mode(0o644);
+                                fs::set_permissions(file, permissions)?;
+                            }
+                            fs::remove_file(file)?;
+                            // print that it's deleted
+                            print_filepath!(file, deleted);
                         }
-                        fs::remove_file(file)?;
-                        // print that it's deleted
-                        print_filepath!(file, deleted);
                     } else {
                         // Otherwise, print that it's a duplicate
                         print_filepath!(file, duplicate);
@@ -904,7 +900,7 @@ mod tests {
             vec![file1.clone(), file2.clone(), file3.clone()],
         );
 
-        let (count, size_saved) = process_duplicates(duplicates, false).unwrap();
+        let (count, size_saved) = process_duplicates(duplicates, false, false).unwrap();
 
         // 3 files with same hash = 2 duplicates
         assert_eq!(count, 2, "Should report 2 duplicates");
@@ -927,7 +923,7 @@ mod tests {
         let mut duplicates: HashMap<String, Vec<PathBuf>> = HashMap::new();
         duplicates.insert("hash456".to_string(), vec![file1.clone(), file2.clone()]);
 
-        let (count, _) = process_duplicates(duplicates, true).unwrap();
+        let (count, _) = process_duplicates(duplicates, true, false).unwrap();
 
         assert_eq!(count, 1, "Should report 1 duplicate");
         // The oldest file (first created) should be kept
@@ -942,7 +938,7 @@ mod tests {
     #[test]
     fn test_process_duplicates_no_duplicates() {
         let duplicates: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        let (count, size_saved) = process_duplicates(duplicates, false).unwrap();
+        let (count, size_saved) = process_duplicates(duplicates, false, false).unwrap();
 
         assert_eq!(count, 0);
         assert_eq!(size_saved, 0);

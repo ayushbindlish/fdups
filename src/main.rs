@@ -26,6 +26,8 @@
 //! ```
 
 use clap::Parser;
+use env_logger::{Builder, Env};
+use log::LevelFilter;
 
 use fdups::find_remove_duplicates;
 
@@ -38,20 +40,37 @@ struct Args {
     /// Automatically delete duplicate files
     #[arg(short, long)]
     delete: bool,
+
+    /// Show what would be deleted without actually deleting
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+
+    /// Output results in JSON format
+    #[arg(short, long)]
+    json: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let report = find_remove_duplicates(&args.path, args.delete)?;
+    // Initialize logging
+    let env = Env::default().filter_or("FDUPS_LOG", "info");
+    Builder::from_env(env).init();
 
-    println!("\n{} total files found.", report.total_files);
-    println!("\n{} duplicates found.", report.duplicate_count);
-    println!("{} bytes in total.", report.total_size_bytes);
-    println!(
-        "{} bytes saved by deleting duplicates.",
-        report.size_saved_bytes
-    );
+    let report = find_remove_duplicates(&args.path, args.delete, args.dry_run)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("\n{} total files found.", report.total_files);
+        println!("\n{} duplicates found.", report.duplicate_count);
+        println!("{} bytes in total.", report.total_size_bytes);
+        println!(
+            "{} bytes saved by deleting duplicates{}.",
+            report.size_saved_bytes,
+            if args.dry_run { " (dry run)" } else { "" }
+        );
+    }
 
     Ok(())
 }
