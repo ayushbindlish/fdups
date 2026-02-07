@@ -139,8 +139,13 @@ impl FileEntry {
 const CACHE_TABLE: TableDefinition<(u64, u64), (u64, u32, u64, &str)> =
     TableDefinition::new("fingerprints");
 
+use cuckoofilter::CuckooFilter;
+use std::collections::hash_map::DefaultHasher;
+use std::sync::RwLock;
+
 pub struct SignatureCache {
     db: Database,
+    filter: RwLock<CuckooFilter<DefaultHasher>>,
 }
 
 impl SignatureCache {
@@ -148,7 +153,27 @@ impl SignatureCache {
         let db = Database::builder()
             .create(path)
             .map_err(|e: redb::DatabaseError| FdupsError::Other(e.to_string()))?;
-        Ok(Self { db })
+
+        // Initialize and populate Cuckoo Filter from existing DB
+        let mut filter = CuckooFilter::new();
+        
+        // Populate filter
+        let read_txn = db.begin_read().map_err(|e| FdupsError::Other(e.to_string()))?;
+        if let Ok(table) = read_txn.open_table(CACHE_TABLE) {
+            if let Ok(iter) = table.iter() {
+                for item in iter {
+                    if let Ok((key, _value)) = item {
+                        let (dev, ino) = key.value();
+                        let _ = filter.add(&(dev, ino));
+                    }
+                }
+            }
+        }
+
+        Ok(Self { 
+            db,
+            filter: RwLock::new(filter),
+        })
     }
 
     pub fn get(
@@ -158,6 +183,18 @@ impl SignatureCache {
         mtime: std::time::SystemTime,
         size: u64,
     ) -> Option<String> {
+        // Fast path: Check in-memory filter first
+        // If not in filter, it's definitely not in DB (no false negatives in Cuckoo Filter?) 
+        // Wait, Cuckoo Filter has NO False Negatives (if usage is correct). 
+        // Meaning: If it returns false, item is NOT in set.
+        // It helps avoid DB lookup for cache miss.
+        {
+            let filter = self.filter.read().ok()?;
+            if !filter.contains(&(dev, ino)) {
+                return None;
+            }
+        }
+
         let read_txn = self.db.begin_read().ok()?;
         let table = read_txn.open_table(CACHE_TABLE).ok()?;
         let value = table.get((dev, ino)).ok()??;
@@ -180,6 +217,13 @@ impl SignatureCache {
         size: u64,
         hash: &str,
     ) -> Result<(), FdupsError> {
+        // Add to in-memory filter
+        {
+            if let Ok(mut filter) = self.filter.write() {
+                let _ = filter.add(&(dev, ino));
+            }
+        }
+
         let write_txn = self
             .db
             .begin_write()
@@ -1535,5 +1579,41 @@ mod tests {
 
         assert_eq!(count, 0);
         assert_eq!(size_saved, 0);
+    }
+
+    #[test]
+    fn test_signature_cache_cuckoo() {
+        use tempfile::NamedTempFile;
+        // Create a temp file for the db
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap();
+
+        // Open cache
+        let cache = SignatureCache::open(path).expect("Failed to open cache");
+
+        // Set a value
+        let dev = 1;
+        let ino = 100;
+        let mtime = std::time::SystemTime::UNIX_EPOCH;
+        let size = 1024;
+        let hash = "deadbeef";
+
+        cache.set(dev, ino, mtime, size, hash).expect("Failed to set cache");
+
+        // Get it back (Hit)
+        let result = cache.get(dev, ino, mtime, size);
+        assert_eq!(result, Some(hash.to_string()));
+
+        // Check miss (different ino)
+        let result_miss = cache.get(dev, 101, mtime, size);
+        assert_eq!(result_miss, None);
+        
+        // Re-open cache to check persistence and filter repopulation
+        drop(cache);
+        let cache2 = SignatureCache::open(path).expect("Failed to repoen cache");
+        
+        // Check hit again (should be in filter after repopulation)
+        let result2 = cache2.get(dev, ino, mtime, size);
+        assert_eq!(result2, Some(hash.to_string()));
     }
 }
