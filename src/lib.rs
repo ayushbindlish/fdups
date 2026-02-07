@@ -702,6 +702,21 @@ pub fn process_duplicates(
                     // If reflink is requested, try to reflink from the original
                     if reflink_requested && !dry_run {
                         let original_path = files[0].path();
+                        
+                        #[cfg(target_os = "linux")]
+                        match safe_reflink(original_path, entry.path()) {
+                            Ok(_) => {
+                                print_filepath!(entry.path(), reflinked);
+                                duplicate_count += 1;
+                                size_saved += entry.size as u128;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("Safe reflink failed for {}: {}. Falling back to default behavior.", entry.path().display(), e);
+                            }
+                        }
+
+                        #[cfg(not(target_os = "linux"))]
                         match reflink::reflink(original_path, entry.path()) {
                             Ok(_) => {
                                 print_filepath!(entry.path(), reflinked);
@@ -883,6 +898,68 @@ fn hash_sparse_file(file: &File, hasher: &mut blake3::Hasher) -> io::Result<Stri
         curr = data_end;
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Atomically replaces `target` with a reflink of `source`.
+///
+/// This function:
+/// 1. Creates a temporary file in the same directory as `target`.
+/// 2. Reflinks `source` to the temporary file.
+/// 3. Atomically swaps the temporary file with `target` using `renameat2(RENAME_EXCHANGE)`.
+/// 4. Deletes the (now swapped) temporary file which contains the old `target` data.
+///
+/// This ensures that `target` is never in a partially-written state and that we
+/// don't lose the original data until the swap is complete (crash consistency).
+#[cfg(target_os = "linux")]
+fn safe_reflink(source: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Create a temp file in the same directory
+    let target_dir = target.parent().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid target parent"))?;
+    let target_name = target.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid target name"))?;
+    
+    let mut temp_name = target_name.to_owned();
+    temp_name.push(".fdups_tmp");
+    let temp_path = target_dir.join(&temp_name);
+
+    // 1. Create temp file (if it exists, remove it first to be clean)
+    if temp_path.exists() {
+        fs::remove_file(&temp_path)?;
+    }
+    
+    // 2. Reflink source to temp_path
+    if let Err(e) = reflink::reflink(source, &temp_path) {
+        // Clean up temp if failed
+        let _ = fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    // 3. Atomic Swap (RENAME_EXCHANGE)
+    // We replace `target` with `temp_path`. RENAME_EXCHANGE swaps them.
+    let temp_c = CString::new(temp_path.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let target_c = CString::new(target.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp_c.as_ptr(),
+            libc::AT_FDCWD,
+            target_c.as_ptr(),
+            libc::RENAME_EXCHANGE
+        )
+    };
+
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    // Swap successful. `temp_path` now refers to the OLD target file.
+    // Delete it.
+    fs::remove_file(&temp_path)?;
+    Ok(())
 }
 
 // ============================================================================
