@@ -12,11 +12,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-use blake2::digest::FixedOutput;
-use blake2::{Blake2b, Digest};
 use dashmap::DashMap;
 use env_logger::*;
-use generic_array::{typenum::U64, GenericArray};
 use human_bytes::human_bytes;
 use ignore::WalkBuilder;
 use log::*;
@@ -30,9 +27,6 @@ pub const BUFFER_SIZE: usize = 65536;
 
 /// Use a constant for partial hash size
 pub const PARTIAL_HASH_SIZE: usize = 512;
-
-/// U64 represents an array length of 64 elements for blake2b
-type OutSize = U64;
 
 /// Finds and Removes(if set) duplicate files in a directory tree.
 ///
@@ -190,13 +184,13 @@ pub fn find_duplicates_with_hasher_cache(
 pub fn partial_hash_file(file_path: &PathBuf) -> io::Result<String> {
     let mut file = BufReader::new(File::open(file_path)?);
 
-    let mut hasher = Blake2b::new();
+    let mut hasher = blake3::Hasher::new();
     let mut buffer = [0; PARTIAL_HASH_SIZE];
     let bytes_read = file.read(&mut buffer)?;
     hasher.update(&buffer[..bytes_read]);
 
-    let hash: GenericArray<u8, OutSize> = hasher.finalize_fixed();
-    Ok(format!("{hash:x}"))
+    let hash = hasher.finalize();
+    Ok(hash.to_hex().to_string())
 }
 
 /// This function groups all the files at the given path by their size.
@@ -425,7 +419,7 @@ pub fn process_duplicates(
 pub fn full_hash_file(file_path: &PathBuf) -> io::Result<String> {
     let mut file = BufReader::new(File::open(file_path)?); // Open the file in buffered mode
 
-    let mut hasher = Blake2b::new(); // Create a new blake2b hasher
+    let mut hasher = blake3::Hasher::new(); // Create a new blake3 hasher
 
     let mut buffer = [0; BUFFER_SIZE]; // Create a buffer to store file chunks
 
@@ -439,8 +433,8 @@ pub fn full_hash_file(file_path: &PathBuf) -> io::Result<String> {
     }
 
     // Finalize the hasher and return the hash as a hex string
-    let hash: GenericArray<u8, OutSize> = hasher.finalize_fixed();
-    Ok(format!("{hash:x}"))
+    let hash = hasher.finalize();
+    Ok(hash.to_hex().to_string())
 }
 
 // ============================================================================

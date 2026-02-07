@@ -14,8 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 rayon = "1.7"
 ignore = "0.4"
-blake2 = "0.10"
-generic-array = "0.14"
+blake3 = "1.5"
 dashmap = "5.4"
 log = "0.4"
 env_logger = "0.10"
