@@ -45,6 +45,10 @@ struct Args {
     #[arg(short = 'n', long)]
     dry_run: bool,
 
+    /// Path to the hash cache (redb)
+    #[arg(long)]
+    pub cache_path: Option<String>,
+
     /// Output results in JSON format
     #[arg(short, long)]
     json: bool,
@@ -64,7 +68,12 @@ fn main() -> anyhow::Result<()> {
     })
     .expect("Error setting Ctrl+C handler");
 
-    let report = find_remove_duplicates(&args.path, args.delete, args.dry_run)?;
+    let report = find_remove_duplicates(
+        &args.path,
+        args.delete,
+        args.dry_run,
+        args.cache_path.as_deref(),
+    )?;
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
