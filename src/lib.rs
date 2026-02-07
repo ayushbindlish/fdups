@@ -28,6 +28,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use term_size::dimensions;
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+mod ioctl {
+    use nix::ioctl_readwrite;
+
+    const FS_IOC_MAGIC: u8 = b'f';
+    const FS_IOC_FIEMAP: u8 = 11;
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct FiemapExtent {
+        pub fe_logical: u64,
+        pub fe_physical: u64,
+        pub fe_length: u64,
+        pub fe_reserved64: [u64; 2],
+        pub fe_flags: u32,
+        pub fe_reserved: [u32; 3],
+    }
+
+    #[repr(C)]
+    pub struct Fiemap {
+        pub fm_start: u64,
+        pub fm_length: u64,
+        pub fm_flags: u32,
+        pub fm_mapped_extents: u32,
+        pub fm_extent_count: u32,
+        pub fm_reserved: u32,
+        pub fm_extents: [FiemapExtent; 1],
+    }
+
+    ioctl_readwrite!(fiemap, FS_IOC_MAGIC, FS_IOC_FIEMAP, Fiemap);
+}
+
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Signal that the tool should shut down gracefully
@@ -250,8 +282,21 @@ pub fn find_duplicates_with_hasher_cache(
     );
     pb.set_message("Hashing files...");
 
+    pb.set_message("Hashing files...");
+
+    // Optimization: Sort by physical location (LBA) to minimize seeking on HDDs
+    // This is "Bleeding-Edge" optimization #2
+    let mut sorted_potential = potential_duplicates;
+    
+    // Only sort if we have a significant number of files, as getting LBA has overhead
+    if sorted_potential.len() > 100 {
+        pb.set_message("Optimizing I/O order...");
+        sort_by_physical_location(&mut sorted_potential);
+        pb.set_message("Hashing files...");
+    }
+
     // Step 1: Group by partial hash (Parallel)
-    potential_duplicates.into_par_iter().for_each(|file_entry| {
+    sorted_potential.into_par_iter().for_each(|file_entry| {
         if is_shutdown() {
             return;
         }
@@ -795,6 +840,82 @@ fn hash_sparse_file(file: &File, hasher: &mut blake3::Hasher) -> io::Result<Stri
         curr = data_end;
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+// ============================================================================
+// LBA / PHYSICAL OFFSET UTILS
+// ============================================================================
+
+#[cfg(target_os = "linux")]
+fn get_physical_offset(path: &PathBuf) -> Option<u64> {
+    use ioctl::{fiemap, Fiemap, FiemapExtent};
+    
+    // Open file securely
+    let file = File::open(path).ok()?;
+    let fd = file.as_raw_fd();
+
+    // Prepare FIEMAP request for the first byte
+    let mut fiemap_struct = Fiemap {
+        fm_start: 0,
+        fm_length: 1, // We only care about the start
+        fm_flags: 0, // FIEMAP_FLAG_SYNC
+        fm_mapped_extents: 0,
+        fm_extent_count: 1,
+        fm_reserved: 0,
+        fm_extents: [FiemapExtent::default()],
+    };
+
+    // Call ioctl
+    unsafe {
+        match fiemap(fd, &mut fiemap_struct) {
+            Ok(_) => {
+                if fiemap_struct.fm_mapped_extents > 0 {
+                    Some(fiemap_struct.fm_extents[0].fe_physical)
+                } else {
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_physical_offset(_path: &PathBuf) -> Option<u64> {
+    None
+}
+
+/// Sorts a vector of FileEntries by their physical location on disk.
+/// This minimizes seek time on rotating media (HDDs).
+fn sort_by_physical_location(entries: &mut Vec<FileEntry>) {
+    // We use a temporary vector to store (lba, index) pairs to avoid repeated syscalls
+    // during sorting comparison
+    let mut lba_map: Vec<(u64, usize)> = entries
+        .par_iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            (get_physical_offset(&entry.path).unwrap_or(u64::MAX), i)
+        })
+        .collect();
+
+    // Sort by LBA
+    lba_map.sort_unstable_by_key(|&(lba, _)| lba);
+
+    // Reorder the original vector
+    // This requires a bit of shuffling, or we can just reconstruct
+    let orig = std::mem::take(entries);
+    let mut new_vec = Vec::with_capacity(orig.len());
+    
+    // Create a lookup for quick move
+    let mut orig_wrappers: Vec<Option<FileEntry>> = orig.into_iter().map(Some).collect();
+    
+    for (_, index) in lba_map {
+        if let Some(entry) = orig_wrappers[index].take() {
+            new_vec.push(entry);
+        }
+    }
+    
+    *entries = new_vec;
 }
 
 // ============================================================================
