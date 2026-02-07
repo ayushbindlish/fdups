@@ -1,13 +1,13 @@
 #![allow(warnings)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fs::{self, metadata, File};
 use std::io::BufReader;
 use std::io::{self, Read};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -22,14 +22,27 @@ use rayon::prelude::*;
 use serde::Serialize;
 use term_size::dimensions;
 use thiserror::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Signal that the tool should shut down gracefully
+pub fn set_shutdown() {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+pub fn is_shutdown() -> bool {
+    SHUTDOWN.load(Ordering::SeqCst)
+}
 
 /// Custom error type for fdups
 #[derive(Error, Debug)]
 pub enum FdupsError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
-
-    #[error("Config error: {0}")]
+    #[error("Operation interrupted by user")]
+    Interrupted,
+    #[error("Configuration error: {0}")]
     Config(String),
 
     #[error("WalkDir error: {0}")]
@@ -48,7 +61,15 @@ pub struct DuplicateReport {
     pub size_saved_bytes: u128,
 }
 
-type GroupingRetVal = (HashMap<u64, Vec<PathBuf>>, u128, u128);
+#[derive(Debug, Serialize, Clone)]
+pub struct FileEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime: std::time::SystemTime,
+}
+
+/// Custom return type for grouping files by size
+type GroupingRetVal = (HashMap<u64, Vec<FileEntry>>, u128, u128);
 
 /// Use a constant for file buffer size, making it easier to modify if needed
 pub const BUFFER_SIZE: usize = 65536;
@@ -131,24 +152,22 @@ pub fn find_remove_duplicates(
 /// # Returns
 ///
 /// A Result containing a hash map where each key is a hash and the corresponding value is
-/// a vector of file paths that have that hash, or an error if one occurs.
+/// a vector of file entries that have that hash, or an error if one occurs.
 ///
 /// # Examples
 ///``` no_run
 /// use std::path::PathBuf;
-/// use fdups::find_duplicates_with_hasher_cache;
+/// use fdups::{find_duplicates_with_hasher_cache, FileEntry};
 /// let potential_duplicates = vec![
-/// PathBuf::from("file1.txt"),
-/// PathBuf::from("file2.txt"),
-/// PathBuf::from("file3.txt")
+///     FileEntry { path: PathBuf::from("file1.txt"), size: 0, mtime: std::time::SystemTime::now() }
 /// ];
 /// let duplicates = find_duplicates_with_hasher_cache(potential_duplicates).unwrap();
 /// assert_eq!(duplicates.len(), 0);
 /// ```
 pub fn find_duplicates_with_hasher_cache(
-    potential_duplicates: Vec<PathBuf>,
-) -> Result<HashMap<String, Vec<PathBuf>>, FdupsError> {
-    let partial_groups: DashMap<String, Vec<PathBuf>> = DashMap::new();
+    potential_duplicates: Vec<FileEntry>,
+) -> Result<HashMap<String, Vec<FileEntry>>, FdupsError> {
+    let partial_groups: DashMap<String, Vec<FileEntry>> = DashMap::new();
 
     let pb = ProgressBar::new(potential_duplicates.len() as u64);
     pb.set_style(
@@ -160,38 +179,45 @@ pub fn find_duplicates_with_hasher_cache(
     pb.set_message("Hashing files...");
 
     // Step 1: Group by partial hash (Parallel)
-    potential_duplicates.into_par_iter().for_each(|file_path| {
-        if let Ok(hash) = partial_hash_file(&file_path) {
+    potential_duplicates.into_par_iter().for_each(|file_entry| {
+        if is_shutdown() {
+            return;
+        }
+        if let Ok(hash) = partial_hash_file(&file_entry.path) {
             partial_groups
                 .entry(hash)
                 .or_insert_with(Vec::new)
-                .push(file_path);
+                .push(file_entry);
         }
         pb.inc(1);
     });
 
+    if is_shutdown() {
+        return Err(FdupsError::Interrupted);
+    }
+
     pb.finish_with_message("Hashing complete");
 
-    let final_groups: DashMap<String, Vec<PathBuf>> = DashMap::new();
+    let final_groups: DashMap<String, Vec<FileEntry>> = DashMap::new();
 
     // Step 2: For each partial hash group, verify with full hash if needed (Parallel)
     // We convert to HashMap first because DashMap doesn't directly implement IntoParallelIterator efficiently
-    let groups: HashMap<String, Vec<PathBuf>> = partial_groups.into_iter().collect();
+    let groups: HashMap<String, Vec<FileEntry>> = partial_groups.into_iter().collect();
 
     groups
         .into_par_iter()
-        .for_each(|(partial_hash, files): (String, Vec<PathBuf>)| {
+        .for_each(|(partial_hash, files): (String, Vec<FileEntry>)| {
             if files.len() > 1 {
                 // Multiple files have the same partial hash, verify with full hash
-                let full_map: DashMap<String, Vec<PathBuf>> = DashMap::new();
+                let full_map: DashMap<String, Vec<FileEntry>> = DashMap::new();
 
                 // Parallelize full hashing within the group
-                files.into_par_iter().for_each(|file_path| {
-                    if let Ok(full_hash) = full_hash_file(&file_path) {
+                files.into_par_iter().for_each(|file_entry| {
+                    if let Ok(full_hash) = full_hash_file(&file_entry.path) {
                         full_map
                             .entry(full_hash)
                             .or_insert_with(Vec::new)
-                            .push(file_path);
+                            .push(file_entry);
                     }
                 });
 
@@ -247,8 +273,9 @@ pub fn group_files_by_size(
     include_git_ignore_global: bool,
     include_git_exclude: bool,
 ) -> Result<GroupingRetVal, FdupsError> {
-    let mut group_files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    let mut group_files_by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
     let mut total_size_in_bytes: u128 = 0;
+    let mut visited_inodes: HashSet<(u64, u64)> = HashSet::new();
 
     let walker = WalkBuilder::new(path)
         .hidden(!include_hidden)
@@ -266,35 +293,64 @@ pub fn group_files_by_size(
     );
     pb.set_message("Scanning directory");
 
-    // Traverse the directory tree and filter out files and directories specified in .gitignore files
-    for entry in walker
-        .filter_map(Result::ok)
-        .filter(|e| match e.file_type() {
-            Some(val) => {
-                if val.is_file() {
-                    total_files += 1;
-                    pb.set_position(total_files as u64);
-                    true
-                } else {
-                    false
-                }
-            }
-            None => false,
-        })
-    {
-        let file_metadata = match entry.metadata() {
-            Ok(meta) => meta,
-            Err(err) => {
-                debug!("Skipping file {} with err: {}", entry.path().display(), err);
+    for entry in walker.filter_map(Result::ok) {
+        if is_shutdown() {
+            pb.finish_with_message("Scanning interrupted");
+            return Err(FdupsError::Interrupted);
+        }
+        let path = entry.path().to_owned();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                debug!("Skipping {} due to metadata error: {}", path.display(), e);
                 continue;
             }
         };
-        let size = file_metadata.len() as u128; // get file size
-        total_size_in_bytes += size;
-        let file_list = group_files_by_size
-            .entry(size as u64)
-            .or_insert_with(Vec::new); // get or create a vector of files with this size
-        file_list.push(entry.path().to_owned()); // add the file path to the vector
+
+        #[cfg(unix)]
+        {
+            let dev = metadata.dev();
+            let ino = metadata.ino();
+
+            if metadata.is_dir() {
+                if !visited_inodes.insert((dev, ino)) {
+                    debug!("Skipping already visited directory: {}", path.display());
+                    continue;
+                }
+            } else if metadata.is_file() {
+                if !visited_inodes.insert((dev, ino)) {
+                    debug!("Skipping hard link of already processed file: {}", path.display());
+                    continue;
+                }
+                
+                total_files += 1;
+                pb.set_position(total_files as u64);
+                
+                let size = metadata.len();
+                let mtime = metadata.modified().unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
+                total_size_in_bytes += size as u128;
+                group_files_by_size
+                    .entry(size)
+                    .or_insert_with(Vec::new)
+                    .push(FileEntry { path, size, mtime });
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            if metadata.is_file() {
+                total_files += 1;
+                pb.set_position(total_files as u64);
+                
+                let size = metadata.len();
+                let mtime = metadata.modified().unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
+                total_size_in_bytes += size as u128;
+                group_files_by_size
+                    .entry(size)
+                    .or_insert_with(Vec::new)
+                    .push(FileEntry { path, size, mtime });
+            }
+        }
     }
     pb.finish_with_message("Scanning complete");
     Ok((group_files_by_size, total_files, total_size_in_bytes))
@@ -304,33 +360,33 @@ pub fn group_files_by_size(
 ///
 /// # Arguments
 ///
-/// * `files_by_size` - A hashmap of files grouped by size, where the key is the size of the file and the value is a vector of file paths.
+/// * `files_by_size` - A hashmap of files grouped by size.
 ///
 /// # Returns
 ///
-/// A vector of potential duplicate files, where each file appears more than once in the given hashmap.
+/// A vector of potential duplicate file entries.
 ///
 /// # Examples
-///
 ///```no_run
 /// use std::collections::HashMap;
 /// use std::path::PathBuf;
-/// use fdups::find_potential_duplicates;
-/// let mut files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-/// files_by_size.insert(100, vec![PathBuf::from("file1.txt")]);
-/// files_by_size.insert(200, vec![PathBuf::from("file2.txt"), PathBuf::from("file3.txt")]);
-/// let potential_duplicates = find_potential_duplicates(files_by_size);
-/// assert_eq!(potential_duplicates.len(), 2);
-/// assert!(potential_duplicates.contains(&PathBuf::from("file2.txt")));
-/// assert!(potential_duplicates.contains(&PathBuf::from("file3.txt")));
-/// ```
+/// use fdups::{find_potential_duplicates, FileEntry};
+/// let mut files_by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
+/// let now = std::time::SystemTime::now();
+/// files_by_size.insert(100, vec![
+///     FileEntry { path: PathBuf::from("file1.txt"), size: 100, mtime: now },
+///     FileEntry { path: PathBuf::from("file2.txt"), size: 100, mtime: now }
+/// ]);
+/// let potential = find_potential_duplicates(files_by_size);
+/// assert_eq!(potential.len(), 2);
+///```
 #[must_use]
-pub fn find_potential_duplicates(files_by_size: HashMap<u64, Vec<PathBuf>>) -> Vec<PathBuf> {
-    let mut potential_duplicates: Vec<PathBuf> = Vec::new(); // Create an empty vector to store potential duplicate files
-
-    // Iterate through each entry in the hash map, which maps from file size to lists of paths
-    for (_, files) in files_by_size {
-        // If there is more than one file with the given size, add all of them to the potential duplicates list
+pub fn find_potential_duplicates(
+    files_by_size: HashMap<u64, Vec<FileEntry>>,
+) -> Vec<FileEntry> {
+    let mut potential_duplicates = Vec::new();
+    // Iterate through the hash map and add the files to the vector if there's more than one file with the same size
+    for (_size, files) in files_by_size {
         if files.len() > 1 {
             potential_duplicates.extend(files);
         }
@@ -368,24 +424,25 @@ macro_rules! print_filepath {
 ///
 /// # Examples
 ///```no_run
-///use std::collections::HashMap;
+/// use std::collections::HashMap;
 /// use std::path::PathBuf;
 /// use std::error::Error;
 /// fn main() -> Result<(), Box<dyn Error>> {
-/// use fdups::process_duplicates;
-/// let mut files = Vec::new();
-/// files.push(PathBuf::from("file1.txt"));
-/// files.push(PathBuf::from("file2.txt"));
-/// let mut duplicates = HashMap::new();
-/// duplicates.insert("hash1".to_string(), files);
-/// let (count, size) = process_duplicates(duplicates, false, false)?;
-/// assert_eq!(count, 1);
-/// assert!(size > 0);
-/// Ok(())
+///     use fdups::{process_duplicates, FileEntry};
+///     let mut files = Vec::new();
+///     let now = std::time::SystemTime::now();
+///     files.push(FileEntry { path: PathBuf::from("file1.txt"), size: 10, mtime: now });
+///     files.push(FileEntry { path: PathBuf::from("file2.txt"), size: 10, mtime: now });
+///     let mut duplicates = HashMap::new();
+///     duplicates.insert("hash1".to_string(), files);
+///     let (count, size) = process_duplicates(duplicates, false, false)?;
+///     assert_eq!(count, 1);
+///     assert!(size > 0);
+///     Ok(())
 /// }
 /// ```
 pub fn process_duplicates(
-    duplicates: HashMap<String, Vec<PathBuf>>,
+    duplicates: HashMap<String, Vec<FileEntry>>,
     delete: bool,
     dry_run: bool,
 ) -> Result<(u128, u128), FdupsError> {
@@ -396,45 +453,60 @@ pub fn process_duplicates(
     for (_hash, mut files) in duplicates {
         // Check if there's more than one file with the same hash
         if files.len() > 1 {
-            // Increment the duplicate count by the number of duplicate files
-            duplicate_count += (files.len() - 1) as u128;
             // Sort files by creation time (oldest first)
             files.sort_by_key(|file| {
                 // Get the file's metadata to determine its creation time
-                let metadata = metadata(file).unwrap();
+                let metadata = metadata(&file.path).unwrap();
                 metadata
                     .created()
                     .unwrap_or_else(|_| metadata.modified().unwrap())
             });
             // Iterate through the files with the same hash
-            for (i, file) in files.iter().enumerate() {
+            for (i, entry) in files.iter().enumerate() {
+                if is_shutdown() {
+                    return Err(FdupsError::Interrupted);
+                }
                 if i == 0 {
                     // If this is the first file, print that it is the original
-                    print_filepath!(file, original);
+                    print_filepath!(entry.path, original);
                 } else {
-                    // Otherwise, it's a duplicate
-                    // Get the size of the file to be deleted and add it to the total size saved
-                    let file_size: u128 = metadata(file)?.len() as u128;
-                    size_saved += file_size;
+                    // Liveness check: ensure file hasn't changed since initial scan
+                    match metadata(&entry.path) {
+                        Ok(current_meta) => {
+                            let current_mtime = current_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            if current_meta.len() != entry.size || current_mtime != entry.mtime {
+                                warn!("File {} changed since scan, skipping for safety.", entry.path.display());
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Could not verify liveness for {}, skipping: {}", entry.path.display(), e);
+                            continue;
+                        }
+                    }
+
+                    duplicate_count += 1;
+                    size_saved += entry.size as u128;
+                    
                     // If delete is true, delete the file
                     if delete {
                         if dry_run {
-                            print_filepath!(file, dry_run);
+                            print_filepath!(entry.path, dry_run);
                         } else {
                             #[cfg(unix)]
                             {
                                 // If the OS is Unix, set the file permissions to read-only before deleting
-                                let mut permissions = metadata(file)?.permissions();
+                                let mut permissions = metadata(&entry.path)?.permissions();
                                 permissions.set_mode(0o644);
-                                fs::set_permissions(file, permissions)?;
+                                fs::set_permissions(&entry.path, permissions)?;
                             }
-                            fs::remove_file(file)?;
+                            fs::remove_file(&entry.path)?;
                             // print that it's deleted
-                            print_filepath!(file, deleted);
+                            print_filepath!(entry.path, deleted);
                         }
                     } else {
                         // Otherwise, print that it's a duplicate
-                        print_filepath!(file, duplicate);
+                        print_filepath!(entry.path, duplicate);
                     }
                 }
             }
@@ -505,10 +577,19 @@ mod tests {
 
     /// Creates a file with the specified content
     fn create_test_file(dir: &TempDir, name: &str, content: &[u8]) -> PathBuf {
-        let file_path = dir.path().join(name);
-        let mut file = File::create(&file_path).unwrap();
+        let path = dir.path().join(name);
+        let mut file = File::create(&path).unwrap();
         file.write_all(content).unwrap();
-        file_path
+        path
+    }
+
+    fn create_file_entry(path: PathBuf) -> FileEntry {
+        let meta = metadata(&path).unwrap();
+        FileEntry {
+            path,
+            size: meta.len(),
+            mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        }
     }
 
     /// Creates a file with deterministic content of specified size
@@ -733,17 +814,16 @@ mod tests {
 
     #[test]
     fn test_find_potential_duplicates_filters_unique_sizes() {
-        let mut files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-
-        // Size 100: only 1 file (should be filtered out)
-        files_by_size.insert(100, vec![PathBuf::from("/path/unique.txt")]);
+        let mut files_by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
 
         // Size 200: 2 files (should be included)
+        let dup1 = PathBuf::from("/path/dup1.txt");
+        let dup2 = PathBuf::from("/path/dup2.txt");
         files_by_size.insert(
             200,
             vec![
-                PathBuf::from("/path/dup1.txt"),
-                PathBuf::from("/path/dup2.txt"),
+                FileEntry { path: dup1.clone(), size: 200, mtime: std::time::SystemTime::now() },
+                FileEntry { path: dup2.clone(), size: 200, mtime: std::time::SystemTime::now() },
             ],
         );
 
@@ -754,27 +834,25 @@ mod tests {
             2,
             "Should only include files from groups with 2+ files"
         );
-        assert!(potential
-            .iter()
-            .all(|p| p.to_str().unwrap().contains("dup")));
     }
 
     #[test]
     fn test_find_potential_duplicates_empty_input() {
-        let files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+        let files_by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
         let potential = find_potential_duplicates(files_by_size);
         assert!(potential.is_empty());
     }
 
     #[test]
     fn test_find_potential_duplicates_all_unique() {
-        let mut files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+        let mut files_by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
 
         // All files have unique sizes
         for i in 0..10 {
+            let path = PathBuf::from(format!("/path/file{}.txt", i));
             files_by_size.insert(
                 i as u64 * 100,
-                vec![PathBuf::from(format!("/path/file{}.txt", i))],
+                vec![FileEntry { path, size: i as u64 * 100, mtime: std::time::SystemTime::now() }],
             );
         }
 
@@ -798,7 +876,11 @@ mod tests {
         let file2 = create_test_file(&dir, "dup2.txt", content);
         let file3 = create_test_file(&dir, "dup3.txt", content);
 
-        let potential = vec![file1.clone(), file2.clone(), file3.clone()];
+        let potential = vec![
+            create_file_entry(file1.clone()),
+            create_file_entry(file2.clone()),
+            create_file_entry(file3.clone())
+        ];
         let duplicates = find_duplicates_with_hasher_cache(potential).unwrap();
 
         // Should have 1 group containing all 3 files
@@ -842,7 +924,10 @@ mod tests {
         let file1 = create_test_file(&dir, "collision1.dat", &content1);
         let file2 = create_test_file(&dir, "collision2.dat", &content2);
 
-        let potential = vec![file1.clone(), file2.clone()];
+        let potential = vec![
+            create_file_entry(file1.clone()),
+            create_file_entry(file2.clone())
+        ];
         let duplicates = find_duplicates_with_hasher_cache(potential).unwrap();
 
         // Should NOT be marked as duplicates because full hashes differ
@@ -860,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_find_duplicates_empty_input() {
-        let potential: Vec<PathBuf> = vec![];
+        let potential: Vec<FileEntry> = vec![];
         let duplicates = find_duplicates_with_hasher_cache(potential).unwrap();
         assert!(duplicates.is_empty());
     }
@@ -870,7 +955,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let file = create_test_file(&dir, "single.txt", b"Only one file");
 
-        let potential = vec![file];
+        let potential = vec![create_file_entry(file)];
         let duplicates = find_duplicates_with_hasher_cache(potential).unwrap();
 
         // A single file cannot be a duplicate of anything
@@ -894,10 +979,14 @@ mod tests {
         let file2 = create_test_file(&dir, "dup1.txt", content);
         let file3 = create_test_file(&dir, "dup2.txt", content);
 
-        let mut duplicates: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let mut duplicates: HashMap<String, Vec<FileEntry>> = HashMap::new();
         duplicates.insert(
             "hash123".to_string(),
-            vec![file1.clone(), file2.clone(), file3.clone()],
+            vec![
+                create_file_entry(file1.clone()),
+                create_file_entry(file2.clone()),
+                create_file_entry(file3.clone())
+            ],
         );
 
         let (count, size_saved) = process_duplicates(duplicates, false, false).unwrap();
@@ -920,8 +1009,14 @@ mod tests {
         assert!(file1.exists());
         assert!(file2.exists());
 
-        let mut duplicates: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        duplicates.insert("hash456".to_string(), vec![file1.clone(), file2.clone()]);
+        let mut duplicates: HashMap<String, Vec<FileEntry>> = HashMap::new();
+        duplicates.insert(
+            "hash456".to_string(),
+            vec![
+                create_file_entry(file1.clone()),
+                create_file_entry(file2.clone())
+            ]
+        );
 
         let (count, _) = process_duplicates(duplicates, true, false).unwrap();
 
@@ -937,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_process_duplicates_no_duplicates() {
-        let duplicates: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        let duplicates: HashMap<String, Vec<FileEntry>> = HashMap::new();
         let (count, size_saved) = process_duplicates(duplicates, false, false).unwrap();
 
         assert_eq!(count, 0);

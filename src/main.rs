@@ -57,6 +57,13 @@ fn main() -> anyhow::Result<()> {
     let env = Env::default().filter_or("FDUPS_LOG", "info");
     Builder::from_env(env).init();
 
+    // Set up signal handling for graceful shutdown
+    ctrlc::set_handler(move || {
+        log::warn!("Interrupt received, shutting down gracefully...");
+        fdups::set_shutdown();
+    })
+    .expect("Error setting Ctrl+C handler");
+
     let report = find_remove_duplicates(&args.path, args.delete, args.dry_run)?;
 
     if args.json {
