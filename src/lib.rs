@@ -5,9 +5,12 @@ use std::env;
 use std::error::Error;
 use std::fs::{self, metadata, File};
 use std::io::BufReader;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+use memmap2::Mmap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -23,6 +26,7 @@ use serde::Serialize;
 use term_size::dimensions;
 use thiserror::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
+use redb::{Database, TableDefinition, ReadableTable};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -66,6 +70,48 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub size: u64,
     pub mtime: std::time::SystemTime,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+const CACHE_TABLE: TableDefinition<(u64, u64), (u64, u32, u64, &str)> = TableDefinition::new("fingerprints");
+
+pub struct SignatureCache {
+    db: Database,
+}
+
+impl SignatureCache {
+    pub fn open(path: &str) -> Result<Self, FdupsError> {
+        let db = Database::builder()
+            .create(path)
+            .map_err(|e: redb::DatabaseError| FdupsError::Other(e.to_string()))?;
+        Ok(Self { db })
+    }
+
+    pub fn get(&self, dev: u64, ino: u64, mtime: std::time::SystemTime, size: u64) -> Option<String> {
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(CACHE_TABLE).ok()?;
+        let value = table.get((dev, ino)).ok()??;
+        let (v_secs, v_nanos, v_size, v_hash) = value.value();
+
+        let duration = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()?;
+        if v_secs == duration.as_secs() && v_nanos == duration.subsec_nanos() && v_size == size {
+            return Some(v_hash.to_string());
+        }
+        None
+    }
+
+    pub fn set(&self, dev: u64, ino: u64, mtime: std::time::SystemTime, size: u64, hash: &str) -> Result<(), FdupsError> {
+        let write_txn = self.db.begin_write().map_err(|e: redb::TransactionError| FdupsError::Other(e.to_string()))?;
+        {
+            let mut table = write_txn.open_table(CACHE_TABLE).map_err(|e: redb::TableError| FdupsError::Other(e.to_string()))?;
+            let duration = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default();
+            table.insert((dev, ino), (duration.as_secs(), duration.subsec_nanos(), size, hash))
+                .map_err(|e: redb::StorageError| FdupsError::Other(e.to_string()))?;
+        }
+        write_txn.commit().map_err(|e: redb::CommitError| FdupsError::Other(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// Custom return type for grouping files by size
@@ -95,7 +141,7 @@ pub const PARTIAL_HASH_SIZE: usize = 512;
 /// use fdups::find_remove_duplicates;
 ///
 /// let path = "/path/to/directory";
-/// let report = find_remove_duplicates(path, true, false).unwrap();
+/// let report = find_remove_duplicates(path, true, false, None).unwrap();
 ///
 /// println!("Found {} duplicates, saved {} bytes by deleting them", report.duplicate_count, report.size_saved_bytes);
 /// ```
@@ -104,20 +150,26 @@ pub fn find_remove_duplicates(
     path: &str,
     delete: bool,
     dry_run: bool,
+    cache_path: Option<&str>,
 ) -> Result<DuplicateReport, FdupsError> {
+    let cache = if let Some(cp) = cache_path {
+        Some(SignatureCache::open(cp)?)
+    } else {
+        None
+    };
+
     debug!("Grouping files by size");
     let (files_by_size, total_files, total_file_sizes_in_bytes) =
         group_files_by_size(path, true, true, true, true)?;
-    // group files by size
-    debug!("Finding potential duplicates");
+
     let potential_duplicates = find_potential_duplicates(files_by_size);
-    // get potential duplicates
-    debug!("Finding duplicates");
-    let duplicates = find_duplicates_with_hasher_cache(potential_duplicates)?;
-    // find duplicates
+
+    debug!("Finding duplicates by hashing");
+    let duplicates = find_duplicates_with_hasher_cache(potential_duplicates, cache.as_ref())?;
+
     debug!("Processing duplicates");
     let (duplicate_count, size_saved) = process_duplicates(duplicates, delete, dry_run)?;
-    // process duplicates
+
     info!(
         "Duplicate Ratio: {}/{} ({:.2}%)",
         duplicate_count,
@@ -152,20 +204,10 @@ pub fn find_remove_duplicates(
 /// # Returns
 ///
 /// A Result containing a hash map where each key is a hash and the corresponding value is
-/// a vector of file entries that have that hash, or an error if one occurs.
-///
-/// # Examples
-///``` no_run
-/// use std::path::PathBuf;
-/// use fdups::{find_duplicates_with_hasher_cache, FileEntry};
-/// let potential_duplicates = vec![
-///     FileEntry { path: PathBuf::from("file1.txt"), size: 0, mtime: std::time::SystemTime::now() }
-/// ];
-/// let duplicates = find_duplicates_with_hasher_cache(potential_duplicates).unwrap();
-/// assert_eq!(duplicates.len(), 0);
-/// ```
+/// A vector of file entries that have that hash, or an error if one occurs.
 pub fn find_duplicates_with_hasher_cache(
     potential_duplicates: Vec<FileEntry>,
+    cache: Option<&SignatureCache>,
 ) -> Result<HashMap<String, Vec<FileEntry>>, FdupsError> {
     let partial_groups: DashMap<String, Vec<FileEntry>> = DashMap::new();
 
@@ -206,50 +248,68 @@ pub fn find_duplicates_with_hasher_cache(
 
     groups
         .into_par_iter()
-        .for_each(|(partial_hash, files): (String, Vec<FileEntry>)| {
+        .for_each(|(_partial_hash, files): (String, Vec<FileEntry>)| {
             if files.len() > 1 {
-                // Multiple files have the same partial hash, verify with full hash
-                let full_map: DashMap<String, Vec<FileEntry>> = DashMap::new();
-
-                // Parallelize full hashing within the group
+                // Tier 2: Tail Hashing
+                let tail_map: DashMap<String, Vec<FileEntry>> = DashMap::new();
                 files.into_par_iter().for_each(|file_entry| {
-                    if let Ok(full_hash) = full_hash_file(&file_entry.path) {
-                        full_map
-                            .entry(full_hash)
-                            .or_insert_with(Vec::new)
-                            .push(file_entry);
+                    if is_shutdown() {
+                        return;
+                    }
+                    if let Ok(hash) = tail_hash_file(&file_entry.path) {
+                        tail_map.entry(hash).or_insert_with(Vec::new).push(file_entry);
                     }
                 });
 
-                // Add all groups from full_map to final_groups
-                for (f_hash, f_files) in full_map {
-                    final_groups.insert(f_hash, f_files);
+                // Tier 3: Full Hashing for remaining groups
+                for (_tail_hash, tail_files) in tail_map {
+                    if tail_files.len() > 1 {
+                        let full_map: DashMap<String, Vec<FileEntry>> = DashMap::new();
+                        tail_files.into_par_iter().for_each(|file_entry| {
+                            if is_shutdown() {
+                                return;
+                            }
+                            if let Ok(full_hash) = full_hash_file(&file_entry, cache) {
+                                full_map.entry(full_hash).or_insert_with(Vec::new).push(file_entry);
+                            }
+                        });
+
+                        for (full_hash, same_files) in full_map {
+                            if same_files.len() > 1 {
+                                final_groups.insert(full_hash, same_files);
+                            }
+                        }
+                    }
                 }
-            } else {
-                // Only one file, keep as is (original behavior)
-                final_groups.insert(partial_hash, files);
             }
         });
 
-    // Convert DashMap to HashMap for return type
-    let mut result = HashMap::new();
-    for (hash, files) in final_groups {
-        result.insert(hash, files);
+    if is_shutdown() {
+        return Err(FdupsError::Interrupted);
     }
-    Ok(result)
+
+    Ok(final_groups.into_iter().collect())
 }
 
-/// Create a partial_hash_file function
+/// Create a partial_hash_file function (Head Hash, 4KB)
 pub fn partial_hash_file(file_path: &PathBuf) -> io::Result<String> {
-    let mut file = BufReader::new(File::open(file_path)?);
+    let mut file = File::open(file_path)?;
+    let mut buffer = [0; 4096];
+    let n = file.read(&mut buffer)?;
+    Ok(blake3::hash(&buffer[..n]).to_hex().to_string())
+}
 
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0; PARTIAL_HASH_SIZE];
-    let bytes_read = file.read(&mut buffer)?;
-    hasher.update(&buffer[..bytes_read]);
-
-    let hash = hasher.finalize();
-    Ok(hash.to_hex().to_string())
+/// Create a tail_hash_file function (Tail Hash, 4KB)
+pub fn tail_hash_file(file_path: &PathBuf) -> io::Result<String> {
+    let mut file = File::open(file_path)?;
+    let len = file.metadata()?.len();
+    if len <= 4096 {
+        return partial_hash_file(file_path);
+    }
+    file.seek(SeekFrom::End(-4096))?;
+    let mut buffer = [0; 4096];
+    let n = file.read(&mut buffer)?;
+    Ok(blake3::hash(&buffer[..n]).to_hex().to_string())
 }
 
 /// This function groups all the files at the given path by their size.
@@ -332,7 +392,7 @@ pub fn group_files_by_size(
                 group_files_by_size
                     .entry(size)
                     .or_insert_with(Vec::new)
-                    .push(FileEntry { path, size, mtime });
+                    .push(FileEntry { path, size, mtime, dev, ino });
             }
         }
 
@@ -348,7 +408,13 @@ pub fn group_files_by_size(
                 group_files_by_size
                     .entry(size)
                     .or_insert_with(Vec::new)
-                    .push(FileEntry { path, size, mtime });
+                    .push(FileEntry {
+                        path,
+                        size,
+                        mtime,
+                        dev: 0,
+                        ino: 0,
+                    });
             }
         }
     }
@@ -374,8 +440,8 @@ pub fn group_files_by_size(
 /// let mut files_by_size: HashMap<u64, Vec<FileEntry>> = HashMap::new();
 /// let now = std::time::SystemTime::now();
 /// files_by_size.insert(100, vec![
-///     FileEntry { path: PathBuf::from("file1.txt"), size: 100, mtime: now },
-///     FileEntry { path: PathBuf::from("file2.txt"), size: 100, mtime: now }
+///     FileEntry { path: PathBuf::from("file1.txt"), size: 100, mtime: now, dev: 0, ino: 0 },
+///     FileEntry { path: PathBuf::from("file2.txt"), size: 100, mtime: now, dev: 0, ino: 0 }
 /// ]);
 /// let potential = find_potential_duplicates(files_by_size);
 /// assert_eq!(potential.len(), 2);
@@ -431,8 +497,8 @@ macro_rules! print_filepath {
 ///     use fdups::{process_duplicates, FileEntry};
 ///     let mut files = Vec::new();
 ///     let now = std::time::SystemTime::now();
-///     files.push(FileEntry { path: PathBuf::from("file1.txt"), size: 10, mtime: now });
-///     files.push(FileEntry { path: PathBuf::from("file2.txt"), size: 10, mtime: now });
+///     files.push(FileEntry { path: PathBuf::from("file1.txt"), size: 10, mtime: now, dev: 0, ino: 0 });
+///     files.push(FileEntry { path: PathBuf::from("file2.txt"), size: 10, mtime: now, dev: 0, ino: 0 });
 ///     let mut duplicates = HashMap::new();
 ///     duplicates.insert("hash1".to_string(), files);
 ///     let (count, size) = process_duplicates(duplicates, false, false)?;
@@ -531,34 +597,63 @@ pub fn process_duplicates(
 ///
 /// ```no_run
 /// use std::path::PathBuf;
-/// use fdups::full_hash_file;
+/// use fdups::{full_hash_file, FileEntry};
 ///
-/// let file_path = PathBuf::from("path/to/file");
-/// let hash_result = full_hash_file(&file_path);
-/// match hash_result {
-///     Ok(hash) => println!("Hash of file {}: {}", file_path.display(), hash),
-///     Err(e) => eprintln!("Error hashing file {}: {}", file_path.display(), e),
-/// }
+/// let entry = FileEntry { 
+///     path: PathBuf::from("file.txt"), 
+///     size: 100, 
+///     mtime: std::time::SystemTime::now(), 
+///     dev: 0, 
+///     ino: 0 
+/// };
+/// let hash_result = full_hash_file(&entry, None);
 /// ```
-pub fn full_hash_file(file_path: &PathBuf) -> io::Result<String> {
-    let mut file = BufReader::new(File::open(file_path)?); // Open the file in buffered mode
-
-    let mut hasher = blake3::Hasher::new(); // Create a new blake3 hasher
-
-    let mut buffer = [0; BUFFER_SIZE]; // Create a buffer to store file chunks
-
-    // Read the file in chunks and update the hasher with each chunk
-    loop {
-        let bytes_read = file.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
+pub fn full_hash_file(
+    entry: &FileEntry,
+    cache: Option<&SignatureCache>,
+) -> io::Result<String> {
+    if let Some(c) = cache {
+        if let Some(h) = c.get(entry.dev, entry.ino, entry.mtime, entry.size) {
+            return Ok(h);
         }
-        hasher.update(&buffer[..bytes_read]);
     }
 
-    // Finalize the hasher and return the hash as a hex string
-    let hash = hasher.finalize();
-    Ok(hash.to_hex().to_string())
+    let file = File::open(&entry.path)?;
+    let meta = file.metadata()?;
+    let len = meta.len();
+
+    let hash_str = if len > 1_048_576 {
+        unsafe {
+            let mmap = Mmap::map(&file)?;
+            #[cfg(target_os = "linux")]
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                0,
+                len as libc::off_t,
+                libc::POSIX_FADV_SEQUENTIAL,
+            );
+            blake3::hash(&mmap).to_hex().to_string()
+        }
+    } else {
+        let mut reader = BufReader::new(file);
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0; BUFFER_SIZE];
+
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..bytes_read]);
+        }
+        hasher.finalize().to_hex().to_string()
+    };
+
+    if let Some(c) = cache {
+        let _ = c.set(entry.dev, entry.ino, entry.mtime, entry.size, &hash_str);
+    }
+
+    Ok(hash_str)
 }
 
 // ============================================================================
@@ -585,10 +680,17 @@ mod tests {
 
     fn create_file_entry(path: PathBuf) -> FileEntry {
         let meta = metadata(&path).unwrap();
+        #[cfg(unix)]
+        let (dev, ino) = (meta.dev(), meta.ino());
+        #[cfg(not(unix))]
+        let (dev, ino) = (0, 0);
+        
         FileEntry {
             path,
             size: meta.len(),
             mtime: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            dev,
+            ino,
         }
     }
 
@@ -603,19 +705,23 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_partial_hash_identical_files_same_hash() {
+    fn test_head_hash_only_reads_first_4096_bytes() {
         let dir = TempDir::new().unwrap();
-        let content = b"Hello, World! This is test content for hashing.";
+        let mut content1 = vec![0x41; 8192]; // 'A'
+        let mut content2 = vec![0x41; 8192]; // 'A'
+        // Same first 4096 bytes
+        // Different bytes after 4096
+        content2[4097] = 0x42; // 'B'
 
-        let file1 = create_test_file(&dir, "file1.txt", content);
-        let file2 = create_test_file(&dir, "file2.txt", content);
+        let file1 = create_test_file(&dir, "head1.dat", &content1);
+        let file2 = create_test_file(&dir, "head2.dat", &content2);
 
         let hash1 = partial_hash_file(&file1).unwrap();
         let hash2 = partial_hash_file(&file2).unwrap();
 
         assert_eq!(
             hash1, hash2,
-            "Identical files should have identical partial hashes"
+            "Headers should be identical even if content after 4KB differs"
         );
     }
 
@@ -632,37 +738,6 @@ mod tests {
         assert_ne!(
             hash1, hash2,
             "Different files should have different partial hashes"
-        );
-    }
-
-    #[test]
-    fn test_partial_hash_only_reads_first_512_bytes() {
-        let dir = TempDir::new().unwrap();
-
-        // Create two files with same first 512 bytes but different content after
-        let mut content1 = vec![0u8; 1024];
-        let mut content2 = vec![0u8; 1024];
-
-        // First 512 bytes are identical
-        for i in 0..512 {
-            content1[i] = (i % 256) as u8;
-            content2[i] = (i % 256) as u8;
-        }
-        // Bytes after 512 are different
-        for i in 512..1024 {
-            content1[i] = 0;
-            content2[i] = 255;
-        }
-
-        let file1 = create_test_file(&dir, "file1.dat", &content1);
-        let file2 = create_test_file(&dir, "file2.dat", &content2);
-
-        let hash1 = partial_hash_file(&file1).unwrap();
-        let hash2 = partial_hash_file(&file2).unwrap();
-
-        assert_eq!(
-            hash1, hash2,
-            "Files with same first 512 bytes should have same partial hash"
         );
     }
 
@@ -687,8 +762,8 @@ mod tests {
         let file1 = create_test_file(&dir, "file1.txt", content);
         let file2 = create_test_file(&dir, "file2.txt", content);
 
-        let hash1 = full_hash_file(&file1).unwrap();
-        let hash2 = full_hash_file(&file2).unwrap();
+        let hash1 = full_hash_file(&create_file_entry(file1.clone()), None).unwrap();
+        let hash2 = full_hash_file(&create_file_entry(file2.clone()), None).unwrap();
 
         assert_eq!(
             hash1, hash2,
@@ -703,8 +778,8 @@ mod tests {
         let file1 = create_test_file(&dir, "file1.txt", b"Content A");
         let file2 = create_test_file(&dir, "file2.txt", b"Content B");
 
-        let hash1 = full_hash_file(&file1).unwrap();
-        let hash2 = full_hash_file(&file2).unwrap();
+        let hash1 = full_hash_file(&create_file_entry(file1.clone()), None).unwrap();
+        let hash2 = full_hash_file(&create_file_entry(file2.clone()), None).unwrap();
 
         assert_ne!(
             hash1, hash2,
@@ -713,33 +788,50 @@ mod tests {
     }
 
     #[test]
-    fn test_full_hash_differs_from_partial_for_large_files() {
+    fn test_head_hash_differs_from_full_for_large_files() {
         let dir = TempDir::new().unwrap();
-        // Create a file larger than 512 bytes
-        let file = create_sized_file(&dir, "large.dat", 2048);
+        // Create a file larger than 4096 bytes
+        let file = create_sized_file(&dir, "large.dat", 8192);
 
         let partial = partial_hash_file(&file).unwrap();
-        let full = full_hash_file(&file).unwrap();
+        let full = full_hash_file(&create_file_entry(file.clone()), None).unwrap();
 
         assert_ne!(
             partial, full,
-            "Partial and full hashes should differ for files > 512 bytes"
+            "Head and full hashes should differ for files > 4KB"
         );
     }
 
     #[test]
     fn test_full_hash_same_as_partial_for_small_files() {
         let dir = TempDir::new().unwrap();
-        // Create a file smaller than 512 bytes
-        let file = create_test_file(&dir, "small.txt", b"Small content");
+        // Small file (say 100 bytes) should have same head and full hash
+        let file = create_sized_file(&dir, "small.dat", 100);
 
         let partial = partial_hash_file(&file).unwrap();
-        let full = full_hash_file(&file).unwrap();
+        let full = full_hash_file(&create_file_entry(file.clone()), None).unwrap();
 
         assert_eq!(
             partial, full,
-            "Partial and full hashes should be identical for files <= 512 bytes"
+            "Head and full hashes should be same for files < 4KB"
         );
+    }
+
+    #[test]
+    fn test_tail_hash_different_for_different_tails() {
+        let dir = TempDir::new().unwrap();
+        let mut content1 = vec![0; 8192];
+        let mut content2 = vec![0; 8192];
+        content1[8191] = 1;
+        content2[8191] = 2;
+
+        let file1 = create_test_file(&dir, "f1.dat", &content1);
+        let file2 = create_test_file(&dir, "f2.dat", &content2);
+
+        // Heads are same (all zeros)
+        assert_eq!(partial_hash_file(&file1).unwrap(), partial_hash_file(&file2).unwrap());
+        // Tails are different
+        assert_ne!(tail_hash_file(&file1).unwrap(), tail_hash_file(&file2).unwrap());
     }
 
     // -------------------------------------------------------------------------
@@ -822,8 +914,8 @@ mod tests {
         files_by_size.insert(
             200,
             vec![
-                FileEntry { path: dup1.clone(), size: 200, mtime: std::time::SystemTime::now() },
-                FileEntry { path: dup2.clone(), size: 200, mtime: std::time::SystemTime::now() },
+                FileEntry { path: dup1.clone(), size: 200, mtime: std::time::SystemTime::now(), dev: 0, ino: 0 },
+                FileEntry { path: dup2.clone(), size: 200, mtime: std::time::SystemTime::now(), dev: 0, ino: 0 },
             ],
         );
 
@@ -852,7 +944,7 @@ mod tests {
             let path = PathBuf::from(format!("/path/file{}.txt", i));
             files_by_size.insert(
                 i as u64 * 100,
-                vec![FileEntry { path, size: i as u64 * 100, mtime: std::time::SystemTime::now() }],
+                vec![FileEntry { path, size: i as u64 * 100, mtime: std::time::SystemTime::now(), dev: 0, ino: 0 }],
             );
         }
 
@@ -881,7 +973,7 @@ mod tests {
             create_file_entry(file2.clone()),
             create_file_entry(file3.clone())
         ];
-        let duplicates = find_duplicates_with_hasher_cache(potential).unwrap();
+        let duplicates = find_duplicates_with_hasher_cache(potential, None).unwrap();
 
         // Should have 1 group containing all 3 files
         let groups_with_multiple: Vec<_> = duplicates
@@ -928,7 +1020,7 @@ mod tests {
             create_file_entry(file1.clone()),
             create_file_entry(file2.clone())
         ];
-        let duplicates = find_duplicates_with_hasher_cache(potential).unwrap();
+        let duplicates = find_duplicates_with_hasher_cache(potential, None).unwrap();
 
         // Should NOT be marked as duplicates because full hashes differ
         let duplicate_groups: Vec<_> = duplicates
@@ -946,7 +1038,7 @@ mod tests {
     #[test]
     fn test_find_duplicates_empty_input() {
         let potential: Vec<FileEntry> = vec![];
-        let duplicates = find_duplicates_with_hasher_cache(potential).unwrap();
+        let duplicates = find_duplicates_with_hasher_cache(potential, None).unwrap();
         assert!(duplicates.is_empty());
     }
 
@@ -956,7 +1048,7 @@ mod tests {
         let file = create_test_file(&dir, "single.txt", b"Only one file");
 
         let potential = vec![create_file_entry(file)];
-        let duplicates = find_duplicates_with_hasher_cache(potential).unwrap();
+        let duplicates = find_duplicates_with_hasher_cache(potential, None).unwrap();
 
         // A single file cannot be a duplicate of anything
         let duplicate_groups: Vec<_> = duplicates

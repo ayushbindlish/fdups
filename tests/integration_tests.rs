@@ -32,7 +32,7 @@ fn find_duplicates(path: &str) -> fdups::DuplicateReport {
     let (files_by_size, total_files, total_size) =
         group_files_by_size(path, true, true, true, true).unwrap();
     let potential_duplicates = find_potential_duplicates(files_by_size);
-    let duplicates = find_duplicates_with_hasher_cache(potential_duplicates).unwrap();
+    let duplicates = find_duplicates_with_hasher_cache(potential_duplicates, None).unwrap();
     let (duplicate_count, size_saved) = process_duplicates(duplicates, false, false).unwrap();
     fdups::DuplicateReport {
         total_files,
@@ -47,7 +47,7 @@ fn find_and_delete_duplicates(path: &str) -> fdups::DuplicateReport {
     let (files_by_size, total_files, total_size) =
         group_files_by_size(path, true, true, true, true).unwrap();
     let potential_duplicates = find_potential_duplicates(files_by_size);
-    let duplicates = find_duplicates_with_hasher_cache(potential_duplicates).unwrap();
+    let duplicates = find_duplicates_with_hasher_cache(potential_duplicates, None).unwrap();
     let (duplicate_count, size_saved) = process_duplicates(duplicates, true, false).unwrap();
     fdups::DuplicateReport {
         total_files,
