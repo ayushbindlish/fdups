@@ -230,8 +230,12 @@ pub fn group_files_by_size(
         .filter_map(Result::ok)
         .filter(|e| match e.file_type() {
             Some(val) => {
-                total_files += 1;
-                val.is_file()
+                if val.is_file() {
+                    total_files += 1;
+                    true
+                } else {
+                    false
+                }
             }
             None => false,
         })
@@ -638,12 +642,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path_str = dir.path().to_str().unwrap();
 
-        let (groups, _total_files, total_size) =
+        let (groups, total_files, total_size) =
             group_files_by_size(path_str, true, true, true, true).unwrap();
 
         assert!(groups.is_empty(), "Empty dir should have no groups");
-        // NOTE: total_files has a bug - it counts all entries including directories,
-        // not just files. This is tracked as a known issue but not fixed here.
+        assert_eq!(total_files, 0, "Empty dir should have 0 files");
         assert_eq!(total_size, 0, "Empty dir should have 0 total size");
     }
 
