@@ -39,7 +39,13 @@ fn create_duplicate_files(dir: &TempDir, count: usize, size: usize) -> Vec<FileE
         let file_path = dir.path().join(format!("dup_{}.dat", i));
         let mut file = File::create(&file_path).unwrap();
         file.write_all(&content).unwrap();
-        entries.push(FileEntry { path: file_path, size: size as u64, mtime: now, dev: 0, ino: 0 });
+        entries.push(FileEntry {
+            path: file_path,
+            size: size as u64,
+            mtime: now,
+            dev: 0,
+            ino: 0,
+        });
     }
     entries
 }
@@ -58,7 +64,13 @@ fn create_partial_hash_collision_files(dir: &TempDir, count: usize) -> Vec<FileE
         let suffix: Vec<u8> = (0..1024).map(|j| ((i + j) % 256) as u8).collect();
         file.write_all(&suffix).unwrap();
         let size = (4096 + 1024) as u64;
-        entries.push(FileEntry { path: file_path, size, mtime: now, dev: 0, ino: 0 });
+        entries.push(FileEntry {
+            path: file_path,
+            size,
+            mtime: now,
+            dev: 0,
+            ino: 0,
+        });
     }
     entries
 }
@@ -109,12 +121,12 @@ fn bench_full_hash_file(c: &mut Criterion) {
     for size in [1024, 1024 * 1024, 10 * 1024 * 1024].iter() {
         let dir = TempDir::new().unwrap();
         let file_path = create_file_with_size(&dir, "test.dat", *size);
-        let entry = FileEntry { 
-            path: file_path.clone(), 
-            size: *size as u64, 
-            mtime: std::time::SystemTime::now(), 
-            dev: 0, 
-            ino: 0 
+        let entry = FileEntry {
+            path: file_path.clone(),
+            size: *size as u64,
+            mtime: std::time::SystemTime::now(),
+            dev: 0,
+            ino: 0,
         };
 
         // Throughput shows actual hashing speed in MB/s
@@ -181,12 +193,12 @@ fn bench_find_potential_duplicates(c: &mut Criterion) {
             // 1 in 5 groups has potential duplicates (2+ files with same size)
             let files_in_group = if i % 5 == 0 { 3 } else { 1 };
             let entries: Vec<FileEntry> = (0..files_in_group)
-                .map(|j| FileEntry { 
+                .map(|j| FileEntry {
                     path: PathBuf::from(format!("/fake/path/file_{}_{}.dat", i, j)),
                     size,
                     mtime: now,
                     dev: 0,
-                    ino: 0
+                    ino: 0,
                 })
                 .collect();
             files_by_size.insert(size, entries);
@@ -287,7 +299,8 @@ fn bench_full_pipeline(c: &mut Criterion) {
                 let (files_by_size, _, _) =
                     group_files_by_size(black_box(&path_str), true, true, true, true).unwrap();
                 let potential_duplicates = find_potential_duplicates(files_by_size);
-                let _duplicates = find_duplicates_with_hasher_cache(potential_duplicates, None).unwrap();
+                let _duplicates =
+                    find_duplicates_with_hasher_cache(potential_duplicates, None).unwrap();
                 // We skip process_duplicates since it does I/O printing
             })
         });
@@ -318,7 +331,8 @@ fn bench_full_pipeline(c: &mut Criterion) {
                 let (files_by_size, _, _) =
                     group_files_by_size(black_box(&path_str), true, true, true, true).unwrap();
                 let potential_duplicates = find_potential_duplicates(files_by_size);
-                let _duplicates = find_duplicates_with_hasher_cache(potential_duplicates, None).unwrap();
+                let _duplicates =
+                    find_duplicates_with_hasher_cache(potential_duplicates, None).unwrap();
             })
         });
     }

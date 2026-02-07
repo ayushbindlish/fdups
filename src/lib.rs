@@ -156,9 +156,11 @@ impl SignatureCache {
 
         // Initialize and populate Cuckoo Filter from existing DB
         let mut filter = CuckooFilter::new();
-        
+
         // Populate filter
-        let read_txn = db.begin_read().map_err(|e| FdupsError::Other(e.to_string()))?;
+        let read_txn = db
+            .begin_read()
+            .map_err(|e| FdupsError::Other(e.to_string()))?;
         if let Ok(table) = read_txn.open_table(CACHE_TABLE) {
             if let Ok(iter) = table.iter() {
                 for item in iter {
@@ -170,7 +172,7 @@ impl SignatureCache {
             }
         }
 
-        Ok(Self { 
+        Ok(Self {
             db,
             filter: RwLock::new(filter),
         })
@@ -184,8 +186,8 @@ impl SignatureCache {
         size: u64,
     ) -> Option<String> {
         // Fast path: Check in-memory filter first
-        // If not in filter, it's definitely not in DB (no false negatives in Cuckoo Filter?) 
-        // Wait, Cuckoo Filter has NO False Negatives (if usage is correct). 
+        // If not in filter, it's definitely not in DB (no false negatives in Cuckoo Filter?)
+        // Wait, Cuckoo Filter has NO False Negatives (if usage is correct).
         // Meaning: If it returns false, item is NOT in set.
         // It helps avoid DB lookup for cache miss.
         {
@@ -361,7 +363,7 @@ pub fn find_duplicates_with_hasher_cache(
     // Optimization: Sort by physical location (LBA) to minimize seeking on HDDs
     // This is "Bleeding-Edge" optimization #2
     let mut sorted_potential = potential_duplicates;
-    
+
     // Only sort if we have a significant number of files, as getting LBA has overhead
     if sorted_potential.len() > 100 {
         pb.set_message("Optimizing I/O order...");
@@ -552,7 +554,7 @@ pub fn group_files_by_size(
                     .modified()
                     .unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
                 total_size_in_bytes += size as u128;
-                
+
                 // Intern the path
                 let path_str = path.to_string_lossy();
                 let spur = get_interner().get_or_intern(&path_str);
@@ -746,7 +748,7 @@ pub fn process_duplicates(
                     // If reflink is requested, try to reflink from the original
                     if reflink_requested && !dry_run {
                         let original_path = files[0].path();
-                        
+
                         #[cfg(target_os = "linux")]
                         match safe_reflink(original_path, entry.path()) {
                             Ok(_) => {
@@ -769,7 +771,11 @@ pub fn process_duplicates(
                                 continue;
                             }
                             Err(e) => {
-                                warn!("Reflink failed for {}: {}. Falling back to default behavior.", entry.path().display(), e);
+                                warn!(
+                                    "Reflink failed for {}: {}. Falling back to default behavior.",
+                                    entry.path().display(),
+                                    e
+                                );
                             }
                         }
                     }
@@ -845,7 +851,7 @@ pub fn full_hash_file(entry: &FileEntry, cache: Option<&SignatureCache>) -> io::
     let hash_str = if len > 1_048_576 {
         unsafe {
             let mut hasher = blake3::Hasher::new();
-            
+
             #[cfg(target_os = "linux")]
             {
                 // Sparse file optimization: skip hashing holes
@@ -934,7 +940,9 @@ fn hash_sparse_file(file: &File, hasher: &mut blake3::Hasher) -> io::Result<Stri
         while left > 0 {
             let to_read = std::cmp::min(left as usize, BUFFER_SIZE);
             let n = file_clone.read(&mut buffer[..to_read])?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&buffer[..n]);
             left -= n as i64;
         }
@@ -960,9 +968,13 @@ fn safe_reflink(source: &std::path::Path, target: &std::path::Path) -> io::Resul
     use std::os::unix::ffi::OsStrExt;
 
     // Create a temp file in the same directory
-    let target_dir = target.parent().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid target parent"))?;
-    let target_name = target.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid target name"))?;
-    
+    let target_dir = target
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid target parent"))?;
+    let target_name = target
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Invalid target name"))?;
+
     let mut temp_name = target_name.to_owned();
     temp_name.push(".fdups_tmp");
     let temp_path = target_dir.join(&temp_name);
@@ -971,7 +983,7 @@ fn safe_reflink(source: &std::path::Path, target: &std::path::Path) -> io::Resul
     if temp_path.exists() {
         fs::remove_file(&temp_path)?;
     }
-    
+
     // 2. Reflink source to temp_path
     if let Err(e) = reflink::reflink(source, &temp_path) {
         // Clean up temp if failed
@@ -981,8 +993,10 @@ fn safe_reflink(source: &std::path::Path, target: &std::path::Path) -> io::Resul
 
     // 3. Atomic Swap (RENAME_EXCHANGE)
     // We replace `target` with `temp_path`. RENAME_EXCHANGE swaps them.
-    let temp_c = CString::new(temp_path.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let target_c = CString::new(target.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let temp_c = CString::new(temp_path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let target_c = CString::new(target.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let ret = unsafe {
         libc::renameat2(
@@ -990,7 +1004,7 @@ fn safe_reflink(source: &std::path::Path, target: &std::path::Path) -> io::Resul
             temp_c.as_ptr(),
             libc::AT_FDCWD,
             target_c.as_ptr(),
-            libc::RENAME_EXCHANGE
+            libc::RENAME_EXCHANGE,
         )
     };
 
@@ -1013,7 +1027,7 @@ fn safe_reflink(source: &std::path::Path, target: &std::path::Path) -> io::Resul
 #[cfg(target_os = "linux")]
 fn get_physical_offset(path: &std::path::Path) -> Option<u64> {
     use ioctl::{fiemap, Fiemap, FiemapExtent};
-    
+
     // Open file securely
     let file = File::open(path).ok()?;
     let fd = file.as_raw_fd();
@@ -1022,7 +1036,7 @@ fn get_physical_offset(path: &std::path::Path) -> Option<u64> {
     let mut fiemap_struct = Fiemap {
         fm_start: 0,
         fm_length: 1, // We only care about the start
-        fm_flags: 0, // FIEMAP_FLAG_SYNC
+        fm_flags: 0,  // FIEMAP_FLAG_SYNC
         fm_mapped_extents: 0,
         fm_extent_count: 1,
         fm_reserved: 0,
@@ -1038,7 +1052,7 @@ fn get_physical_offset(path: &std::path::Path) -> Option<u64> {
                 } else {
                     None
                 }
-            },
+            }
             Err(_) => None,
         }
     }
@@ -1057,9 +1071,7 @@ fn sort_by_physical_location(entries: &mut Vec<FileEntry>) {
     let mut lba_map: Vec<(u64, usize)> = entries
         .par_iter()
         .enumerate()
-        .map(|(i, entry)| {
-            (get_physical_offset(entry.path()).unwrap_or(u64::MAX), i)
-        })
+        .map(|(i, entry)| (get_physical_offset(entry.path()).unwrap_or(u64::MAX), i))
         .collect();
 
     // Sort by LBA
@@ -1069,16 +1081,16 @@ fn sort_by_physical_location(entries: &mut Vec<FileEntry>) {
     // This requires a bit of shuffling, or we can just reconstruct
     let orig = std::mem::take(entries);
     let mut new_vec = Vec::with_capacity(orig.len());
-    
+
     // Create a lookup for quick move
     let mut orig_wrappers: Vec<Option<FileEntry>> = orig.into_iter().map(Some).collect();
-    
+
     for (_, index) in lba_map {
         if let Some(entry) = orig_wrappers[index].take() {
             new_vec.push(entry);
         }
     }
-    
+
     *entries = new_vec;
 }
 
@@ -1346,20 +1358,8 @@ mod tests {
         files_by_size.insert(
             200,
             vec![
-                FileEntry::new(
-                    dup1.clone(),
-                    200,
-                    std::time::SystemTime::now(),
-                    0,
-                    0,
-                ),
-                FileEntry::new(
-                    dup2.clone(),
-                    200,
-                    std::time::SystemTime::now(),
-                    0,
-                    0,
-                ),
+                FileEntry::new(dup1.clone(), 200, std::time::SystemTime::now(), 0, 0),
+                FileEntry::new(dup2.clone(), 200, std::time::SystemTime::now(), 0, 0),
             ],
         );
 
@@ -1598,7 +1598,9 @@ mod tests {
         let size = 1024;
         let hash = "deadbeef";
 
-        cache.set(dev, ino, mtime, size, hash).expect("Failed to set cache");
+        cache
+            .set(dev, ino, mtime, size, hash)
+            .expect("Failed to set cache");
 
         // Get it back (Hit)
         let result = cache.get(dev, ino, mtime, size);
@@ -1607,11 +1609,11 @@ mod tests {
         // Check miss (different ino)
         let result_miss = cache.get(dev, 101, mtime, size);
         assert_eq!(result_miss, None);
-        
+
         // Re-open cache to check persistence and filter repopulation
         drop(cache);
         let cache2 = SignatureCache::open(path).expect("Failed to repoen cache");
-        
+
         // Check hit again (should be in filter after repopulation)
         let result2 = cache2.get(dev, ino, mtime, size);
         assert_eq!(result2, Some(hash.to_string()));
