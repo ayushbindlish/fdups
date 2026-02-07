@@ -31,6 +31,9 @@ type GroupingRetVal = (HashMap<u64, Vec<PathBuf>>, u128, u128);
 /// Use a constant for file buffer size, making it easier to modify if needed
 pub const BUFFER_SIZE: usize = 65536;
 
+/// Use a constant for partial hash size
+pub const PARTIAL_HASH_SIZE: usize = 512;
+
 /// U64 represents an array length of 64 elements for blake2b
 type OutSize = U64;
 
@@ -186,7 +189,7 @@ pub fn partial_hash_file(file_path: &PathBuf) -> io::Result<String> {
     let mut file = BufReader::new(File::open(file_path)?);
 
     let mut hasher = Blake2b::new();
-    let mut buffer = [0; BUFFER_SIZE];
+    let mut buffer = [0; PARTIAL_HASH_SIZE];
     let bytes_read = file.read(&mut buffer)?;
     hasher.update(&buffer[..bytes_read]);
 
