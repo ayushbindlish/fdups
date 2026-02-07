@@ -25,20 +25,27 @@
 //! println!("Found {} duplicates, saved {} bytes by deleting them", duplicate_count, size_saved);
 //! ```
 
-use std::env;
+use clap::Parser;
 use std::error::Error;
 
 use fdups::find_remove_duplicates;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
-    let delete = args.contains(&String::from("--delete"));
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// The directory path to search for duplicates
+    path: String,
 
-    // The first argument is the directory path
-    let path = args.get(1).expect("Missing directory argument");
+    /// Automatically delete duplicate files
+    #[arg(short, long)]
+    delete: bool,
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = Args::parse();
 
     let (total_files, duplicate_count, total_file_size, size_saved) =
-        find_remove_duplicates(path, delete)?;
+        find_remove_duplicates(&args.path, args.delete)?;
 
     println!("\n{total_files} total files found.");
     println!("\n{duplicate_count} duplicates found.");

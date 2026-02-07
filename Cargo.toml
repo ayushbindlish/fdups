@@ -21,7 +21,7 @@ log = "0.4"
 env_logger = "0.10"
 term_size = "0.3"
 human_bytes = { version = "0.4", default-features = false, features = ["fast"] }
-clap = "4.2"
+clap = { version = "4.2", features = ["derive"] }
 anyhow = "1.0"
 thiserror = "1.0"
 
