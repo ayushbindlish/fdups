@@ -29,7 +29,7 @@ type ChannelData = (String, PathBuf);
 type GroupingRetVal = (HashMap<u64, Vec<PathBuf>>, u128, u128);
 
 /// Use a constant for file buffer size, making it easier to modify if needed
-pub const BUFFER_SIZE: usize = 512;
+pub const BUFFER_SIZE: usize = 65536;
 
 /// U64 represents an array length of 64 elements for blake2b
 type OutSize = U64;
