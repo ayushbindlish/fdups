@@ -16,6 +16,7 @@ use dashmap::DashMap;
 use env_logger::*;
 use human_bytes::human_bytes;
 use ignore::WalkBuilder;
+use indicatif::{ProgressBar, ProgressStyle};
 use log::*;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -161,6 +162,15 @@ pub fn find_duplicates_with_hasher_cache(
 ) -> Result<HashMap<String, Vec<PathBuf>>, FdupsError> {
     let partial_groups: DashMap<String, Vec<PathBuf>> = DashMap::new();
 
+    let pb = ProgressBar::new(potential_duplicates.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .map_err(|e| FdupsError::Other(e.to_string()))?
+            .progress_chars("#>-"),
+    );
+    pb.set_message("Hashing files...");
+
     // Step 1: Group by partial hash (Parallel)
     potential_duplicates.into_par_iter().for_each(|file_path| {
         if let Ok(hash) = partial_hash_file(&file_path) {
@@ -169,7 +179,10 @@ pub fn find_duplicates_with_hasher_cache(
                 .or_insert_with(Vec::new)
                 .push(file_path);
         }
+        pb.inc(1);
     });
+
+    pb.finish_with_message("Hashing complete");
 
     let final_groups: DashMap<String, Vec<PathBuf>> = DashMap::new();
 
@@ -255,7 +268,16 @@ pub fn group_files_by_size(
         .git_global(!include_git_ignore_global) // respect global git ignore
         .git_exclude(!include_git_exclude) // respect git exclude files
         .build();
-    let mut total_files = 0;
+    let mut total_files: u128 = 0;
+
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] {msg}: {pos} files")
+            .map_err(|e| FdupsError::Other(e.to_string()))?,
+    );
+    pb.set_message("Scanning directory");
+
     // Traverse the directory tree and filter out files and directories specified in .gitignore files
     for entry in walker
         .filter_map(Result::ok)
@@ -263,6 +285,7 @@ pub fn group_files_by_size(
             Some(val) => {
                 if val.is_file() {
                     total_files += 1;
+                    pb.set_position(total_files as u64);
                     true
                 } else {
                     false
@@ -285,6 +308,7 @@ pub fn group_files_by_size(
             .or_insert_with(Vec::new); // get or create a vector of files with this size
         file_list.push(entry.path().to_owned()); // add the file path to the vector
     }
+    pb.finish_with_message("Scanning complete");
     Ok((group_files_by_size, total_files, total_size_in_bytes))
 }
 
