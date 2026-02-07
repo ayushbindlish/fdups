@@ -23,9 +23,6 @@ use log::*;
 use rayon::prelude::*;
 use term_size::dimensions;
 
-/// Define the type for the data sent through the channel
-type ChannelData = (String, PathBuf);
-
 type GroupingRetVal = (HashMap<u64, Vec<PathBuf>>, u128, u128);
 
 /// Use a constant for file buffer size, making it easier to modify if needed
@@ -136,52 +133,57 @@ pub fn find_remove_duplicates(
 pub fn find_duplicates_with_hasher_cache(
     potential_duplicates: Vec<PathBuf>,
 ) -> Result<HashMap<String, Vec<PathBuf>>, Box<dyn Error>> {
-    let mut duplicates: HashMap<String, Vec<PathBuf>> = HashMap::new(); // Create a hash map to store files grouped by size
-                                                                        // Use DashMap for caching hashes
-    let hasher_cache: Arc<DashMap<PathBuf, String>> = Arc::new(DashMap::new());
+    let partial_groups: DashMap<String, Vec<PathBuf>> = DashMap::new();
 
-    let (tx, rx): (Sender<ChannelData>, Receiver<ChannelData>) = channel(); // Create a message passing channel to send hashes and file paths between threads
+    // Step 1: Group by partial hash (Parallel)
+    potential_duplicates.into_par_iter().for_each(|file_path| {
+        if let Ok(hash) = partial_hash_file(&file_path) {
+            partial_groups
+                .entry(hash)
+                .or_insert_with(Vec::new)
+                .push(file_path);
+        }
+    });
 
-    potential_duplicates
+    let final_groups: DashMap<String, Vec<PathBuf>> = DashMap::new();
+
+    // Step 2: For each partial hash group, verify with full hash if needed (Parallel)
+    // We convert to HashMap first because DashMap doesn't directly implement IntoParallelIterator efficiently
+    let groups: HashMap<String, Vec<PathBuf>> = partial_groups.into_iter().collect();
+
+    groups
         .into_par_iter()
-        .for_each_with(tx.clone(), |tx, file_path| {
-            // Remove Mutex locking
-            if let Some(cached_hash) = hasher_cache.get(&file_path) {
-                tx.send((cached_hash.clone(), file_path)).unwrap();
-            } else {
-                // Use partial_hash_file function
-                let hash_result = partial_hash_file(&file_path);
+        .for_each(|(partial_hash, files): (String, Vec<PathBuf>)| {
+            if files.len() > 1 {
+                // Multiple files have the same partial hash, verify with full hash
+                let full_map: DashMap<String, Vec<PathBuf>> = DashMap::new();
 
-                if let Ok(hash) = hash_result {
-                    hasher_cache.insert(file_path.clone(), hash.clone());
-                    tx.send((hash, file_path)).unwrap();
+                // Parallelize full hashing within the group
+                files.into_par_iter().for_each(|file_path| {
+                    if let Ok(full_hash) = full_hash_file(&file_path) {
+                        full_map
+                            .entry(full_hash)
+                            .or_insert_with(Vec::new)
+                            .push(file_path);
+                    }
+                });
+
+                // Add all groups from full_map to final_groups
+                for (f_hash, f_files) in full_map {
+                    final_groups.insert(f_hash, f_files);
                 }
+            } else {
+                // Only one file, keep as is (original behavior)
+                final_groups.insert(partial_hash, files);
             }
         });
 
-    drop(tx); // Drop the sender so the receiver knows there are no more messages coming
-
-    // Iterate through the received messages containing hashes and file paths
-    for (hash, file_path) in rx {
-        let file_list = duplicates.entry(hash).or_insert_with(Vec::new); // Get or create a vector of files with this hash
-        if !file_list.is_empty() {
-            let full_hash1 = full_hash_file(&file_path)?;
-            let mut is_duplicate = false;
-            for dup_path in file_list.iter() {
-                let full_hash2 = full_hash_file(dup_path)?;
-                if full_hash1 == full_hash2 {
-                    is_duplicate = true;
-                    break;
-                }
-            }
-            if is_duplicate {
-                file_list.push(file_path); // Add the file path to the vector
-            }
-        } else {
-            file_list.push(file_path); // Add the file path to the vector
-        }
+    // Convert DashMap to HashMap for return type
+    let mut result = HashMap::new();
+    for (hash, files) in final_groups {
+        result.insert(hash, files);
     }
-    Ok(duplicates)
+    Ok(result)
 }
 
 /// Create a partial_hash_file function
