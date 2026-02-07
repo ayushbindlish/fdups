@@ -28,23 +28,33 @@ fn create_file(dir: &TempDir, path: &str, content: &[u8]) -> PathBuf {
 }
 
 /// Runs the full duplicate detection pipeline (without the logger issue)
-fn find_duplicates(path: &str) -> (u128, u128, u128, u128) {
+fn find_duplicates(path: &str) -> fdups::DuplicateReport {
     let (files_by_size, total_files, total_size) =
         group_files_by_size(path, true, true, true, true).unwrap();
     let potential_duplicates = find_potential_duplicates(files_by_size);
     let duplicates = find_duplicates_with_hasher_cache(potential_duplicates).unwrap();
     let (duplicate_count, size_saved) = process_duplicates(duplicates, false).unwrap();
-    (total_files, duplicate_count, total_size, size_saved)
+    fdups::DuplicateReport {
+        total_files,
+        total_size_bytes: total_size,
+        duplicate_count,
+        size_saved_bytes: size_saved,
+    }
 }
 
 /// Runs the full pipeline with delete enabled
-fn find_and_delete_duplicates(path: &str) -> (u128, u128, u128, u128) {
+fn find_and_delete_duplicates(path: &str) -> fdups::DuplicateReport {
     let (files_by_size, total_files, total_size) =
         group_files_by_size(path, true, true, true, true).unwrap();
     let potential_duplicates = find_potential_duplicates(files_by_size);
     let duplicates = find_duplicates_with_hasher_cache(potential_duplicates).unwrap();
     let (duplicate_count, size_saved) = process_duplicates(duplicates, true).unwrap();
-    (total_files, duplicate_count, total_size, size_saved)
+    fdups::DuplicateReport {
+        total_files,
+        total_size_bytes: total_size,
+        duplicate_count,
+        size_saved_bytes: size_saved,
+    }
 }
 
 // ============================================================================
@@ -62,10 +72,10 @@ fn test_e2e_no_duplicates() {
     }
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, _) = find_duplicates(path);
+    let report = find_duplicates(path);
 
     assert_eq!(
-        duplicate_count, 0,
+        report.duplicate_count, 0,
         "Should find no duplicates among unique files"
     );
 }
@@ -81,15 +91,15 @@ fn test_e2e_exact_duplicates() {
     }
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, size_saved) = find_duplicates(path);
+    let report = find_duplicates(path);
 
     // 4 identical files = 3 duplicates (1 original + 3 dups)
     assert_eq!(
-        duplicate_count, 3,
+        report.duplicate_count, 3,
         "Should find 3 duplicates among 4 identical files"
     );
     assert_eq!(
-        size_saved,
+        report.size_saved_bytes,
         3 * content.len() as u128,
         "Size saved should be 3 * file size"
     );
@@ -105,10 +115,10 @@ fn test_e2e_same_size_different_content() {
     create_file(&dir, "c.txt", b"ABCDEFGH"); // 8 bytes
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, _) = find_duplicates(path);
+    let report = find_duplicates(path);
 
     assert_eq!(
-        duplicate_count, 0,
+        report.duplicate_count, 0,
         "Files with same size but different content should not be duplicates"
     );
 }
@@ -137,10 +147,10 @@ fn test_e2e_partial_hash_collision() {
     create_file(&dir, "partial2.dat", &content2);
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, _) = find_duplicates(path);
+    let report = find_duplicates(path);
 
     assert_eq!(
-        duplicate_count, 0,
+        report.duplicate_count, 0,
         "Files with same partial hash but different full content should NOT be duplicates"
     );
 }
@@ -150,11 +160,11 @@ fn test_e2e_empty_directory() {
     let dir = TempDir::new().unwrap();
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, total_size, size_saved) = find_duplicates(path);
+    let report = find_duplicates(path);
 
-    assert_eq!(duplicate_count, 0);
-    assert_eq!(total_size, 0);
-    assert_eq!(size_saved, 0);
+    assert_eq!(report.duplicate_count, 0);
+    assert_eq!(report.total_size_bytes, 0);
+    assert_eq!(report.size_saved_bytes, 0);
 }
 
 #[test]
@@ -169,11 +179,11 @@ fn test_e2e_nested_directories() {
     create_file(&dir, "other/c.txt", content);
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, _) = find_duplicates(path);
+    let report = find_duplicates(path);
 
-    // 4 identical files across different directories = 3 duplicates
+    // 4 identical files = 3 duplicates
     assert_eq!(
-        duplicate_count, 3,
+        report.duplicate_count, 3,
         "Should find duplicates across nested directories"
     );
 }
@@ -194,9 +204,9 @@ fn test_e2e_delete_removes_duplicates() {
     assert!(file3.exists());
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, _) = find_and_delete_duplicates(path);
+    let report = find_and_delete_duplicates(path);
 
-    assert_eq!(duplicate_count, 2, "Should report 2 duplicates");
+    assert_eq!(report.duplicate_count, 2, "Should report 2 duplicates");
 
     // Count remaining files
     let remaining: Vec<_> = [file1, file2, file3]
@@ -240,13 +250,13 @@ fn test_e2e_mixed_scenario() {
     create_file(&dir, "same_size_2.txt", b"BBBBBBBB");
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, _) = find_duplicates(path);
+    let report = find_duplicates(path);
 
     // Dup set 1: 2 duplicates (1 original + 2 dups)
     // Dup set 2: 1 duplicate (1 original + 1 dup)
     // Total: 3 duplicates
     assert_eq!(
-        duplicate_count, 3,
+        report.duplicate_count, 3,
         "Should find 3 duplicates in mixed scenario"
     );
 }
@@ -263,13 +273,13 @@ fn test_e2e_large_files() {
     create_file(&dir, "large2.dat", &content);
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, size_saved) = find_duplicates(path);
+    let report = find_duplicates(path);
 
     assert_eq!(
-        duplicate_count, 1,
+        report.duplicate_count, 1,
         "Should find 1 duplicate for 2 identical large files"
     );
-    assert_eq!(size_saved, size as u128, "Size saved should be 1MB");
+    assert_eq!(report.size_saved_bytes, size as u128, "Size saved should be 1MB");
 }
 
 #[test]
@@ -279,9 +289,9 @@ fn test_e2e_single_file() {
     create_file(&dir, "only_one.txt", b"Just one file");
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, _) = find_duplicates(path);
+    let report = find_duplicates(path);
 
-    assert_eq!(duplicate_count, 0, "Single file cannot have duplicates");
+    assert_eq!(report.duplicate_count, 0, "Single file cannot have duplicates");
 }
 
 #[test]
@@ -293,8 +303,8 @@ fn test_e2e_two_empty_files() {
     create_file(&dir, "empty2.txt", b"");
 
     let path = dir.path().to_str().unwrap();
-    let (_, duplicate_count, _, _) = find_duplicates(path);
+    let report = find_duplicates(path);
 
     // Two empty files should be detected as duplicates
-    assert_eq!(duplicate_count, 1, "Two empty files should be duplicates");
+    assert_eq!(report.duplicate_count, 1, "Two empty files should be duplicates");
 }

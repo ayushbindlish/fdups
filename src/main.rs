@@ -26,7 +26,6 @@
 //! ```
 
 use clap::Parser;
-use std::error::Error;
 
 use fdups::find_remove_duplicates;
 
@@ -41,16 +40,18 @@ struct Args {
     delete: bool,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let (total_files, duplicate_count, total_file_size, size_saved) =
-        find_remove_duplicates(&args.path, args.delete)?;
+    let report = find_remove_duplicates(&args.path, args.delete)?;
 
-    println!("\n{total_files} total files found.");
-    println!("\n{duplicate_count} duplicates found.");
-    println!("{total_file_size} bytes in total.");
-    println!("{size_saved} bytes saved by deleting duplicates.");
+    println!("\n{} total files found.", report.total_files);
+    println!("\n{} duplicates found.", report.duplicate_count);
+    println!("{} bytes in total.", report.total_size_bytes);
+    println!(
+        "{} bytes saved by deleting duplicates.",
+        report.size_saved_bytes
+    );
 
     Ok(())
 }

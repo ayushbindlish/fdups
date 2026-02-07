@@ -18,7 +18,34 @@ use human_bytes::human_bytes;
 use ignore::WalkBuilder;
 use log::*;
 use rayon::prelude::*;
+use serde::Serialize;
 use term_size::dimensions;
+use thiserror::Error;
+
+/// Custom error type for fdups
+#[derive(Error, Debug)]
+pub enum FdupsError {
+    #[error("IO error: {0}")]
+    Io(#[from] io::Error),
+
+    #[error("Config error: {0}")]
+    Config(String),
+
+    #[error("WalkDir error: {0}")]
+    Walk(String),
+
+    #[error("Unexpected error: {0}")]
+    Other(String),
+}
+
+/// A structured report of the duplicate detection results
+#[derive(Serialize, Debug, Default)]
+pub struct DuplicateReport {
+    pub total_files: u128,
+    pub total_size_bytes: u128,
+    pub duplicate_count: u128,
+    pub size_saved_bytes: u128,
+}
 
 type GroupingRetVal = (HashMap<u64, Vec<PathBuf>>, u128, u128);
 
@@ -46,21 +73,26 @@ pub const PARTIAL_HASH_SIZE: usize = 512;
 /// use fdups::find_remove_duplicates;
 ///
 /// let path = "/path/to/directory";
-/// let (total_files,duplicate_count, total_file_size, size_saved) = find_remove_duplicates(path, true).unwrap();
+/// let report = find_remove_duplicates(path, true).unwrap();
 ///
-/// println!("Found {} duplicates, saved {} bytes by deleting them", duplicate_count, size_saved);
+/// println!("Found {} duplicates, saved {} bytes by deleting them", report.duplicate_count, report.size_saved_bytes);
 /// ```
 pub fn find_remove_duplicates(
     path: &str,
     delete: bool,
-) -> Result<(u128, u128, u128, u128), Box<dyn Error>> {
+) -> Result<DuplicateReport, FdupsError> {
     // Read the logging level from the RUST_LOG environment variable or set error as default
     let filter_level = env::var("FDUPS_LOG").unwrap_or_else(|_| "error".to_owned());
 
     // Initialize the logging system from environment
     // Using try_init() instead of init() to avoid panic if logger is already initialized
     let mut builder = Builder::new();
-    builder.filter_module("fdups", filter_level.parse::<LevelFilter>()?);
+    builder.filter_module(
+        "fdups",
+        filter_level
+            .parse::<LevelFilter>()
+            .map_err(|e| FdupsError::Config(e.to_string()))?,
+    );
     let _ = builder.try_init(); // Ignore error if logger already initialized
 
     debug!("Grouping files by size");
@@ -88,12 +120,12 @@ pub fn find_remove_duplicates(
         human_bytes(total_file_sizes_in_bytes as f64),
         (size_saved as f64 / total_file_sizes_in_bytes as f64) * 100.0
     );
-    Ok((
+    Ok(DuplicateReport {
         total_files,
+        total_size_bytes: total_file_sizes_in_bytes,
         duplicate_count,
-        total_file_sizes_in_bytes,
-        size_saved,
-    ))
+        size_saved_bytes: size_saved,
+    })
 }
 
 /// Finds duplicates among potential duplicate.
@@ -126,7 +158,7 @@ pub fn find_remove_duplicates(
 /// ```
 pub fn find_duplicates_with_hasher_cache(
     potential_duplicates: Vec<PathBuf>,
-) -> Result<HashMap<String, Vec<PathBuf>>, Box<dyn Error>> {
+) -> Result<HashMap<String, Vec<PathBuf>>, FdupsError> {
     let partial_groups: DashMap<String, Vec<PathBuf>> = DashMap::new();
 
     // Step 1: Group by partial hash (Parallel)
@@ -213,7 +245,7 @@ pub fn group_files_by_size(
     include_git_ignore: bool,
     include_git_ignore_global: bool,
     include_git_exclude: bool,
-) -> Result<GroupingRetVal, Box<dyn Error>> {
+) -> Result<GroupingRetVal, FdupsError> {
     let mut group_files_by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     let mut total_size_in_bytes: u128 = 0;
 
@@ -340,7 +372,7 @@ macro_rules! print_filepath {
 pub fn process_duplicates(
     duplicates: HashMap<String, Vec<PathBuf>>,
     delete: bool,
-) -> Result<(u128, u128), Box<dyn Error>> {
+) -> Result<(u128, u128), FdupsError> {
     // Define variables to keep track of the number of duplicates and amount of disk space saved
     let mut duplicate_count: u128 = 0;
     let mut size_saved: u128 = 0;
