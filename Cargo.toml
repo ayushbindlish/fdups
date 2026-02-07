@@ -30,6 +30,11 @@ ctrlc = "3.4"
 memmap2 = "0.9"
 libc = "0.2"
 redb = "2.1"
+nix = { version = "0.27", features = ["fs", "ioctl"] }
+reflink = "0.1"
+lasso = "0.7"
+cuckoofilter = "0.5"
+rio = "0.9"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

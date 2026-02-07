@@ -52,6 +52,10 @@ struct Args {
     /// Output results in JSON format
     #[arg(short, long)]
     json: bool,
+
+    /// Use copy-on-write reflinks (FICLONERANGE) instead of deleting duplicates
+    #[arg(short, long)]
+    reflink: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -73,6 +77,7 @@ fn main() -> anyhow::Result<()> {
         args.delete,
         args.dry_run,
         args.cache_path.as_deref(),
+        args.reflink,
     )?;
 
     if args.json {
@@ -82,8 +87,13 @@ fn main() -> anyhow::Result<()> {
         println!("\n{} duplicates found.", report.duplicate_count);
         println!("{} bytes in total.", report.total_size_bytes);
         println!(
-            "{} bytes saved by deleting duplicates{}.",
+            "{} bytes {}by deleting duplicates{}.",
             report.size_saved_bytes,
+            if args.delete && !args.dry_run {
+                "saved "
+            } else {
+                "can be saved "
+            },
             if args.dry_run { " (dry run)" } else { "" }
         );
     }

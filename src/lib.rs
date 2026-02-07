@@ -1,5 +1,6 @@
 #![allow(warnings)]
 
+use memmap2::Mmap;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
@@ -10,7 +11,6 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-use memmap2::Mmap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -22,11 +22,11 @@ use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::*;
 use rayon::prelude::*;
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use term_size::dimensions;
 use thiserror::Error;
-use std::sync::atomic::{AtomicBool, Ordering};
-use redb::{Database, TableDefinition, ReadableTable};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -74,7 +74,8 @@ pub struct FileEntry {
     pub ino: u64,
 }
 
-const CACHE_TABLE: TableDefinition<(u64, u64), (u64, u32, u64, &str)> = TableDefinition::new("fingerprints");
+const CACHE_TABLE: TableDefinition<(u64, u64), (u64, u32, u64, &str)> =
+    TableDefinition::new("fingerprints");
 
 pub struct SignatureCache {
     db: Database,
@@ -88,28 +89,56 @@ impl SignatureCache {
         Ok(Self { db })
     }
 
-    pub fn get(&self, dev: u64, ino: u64, mtime: std::time::SystemTime, size: u64) -> Option<String> {
+    pub fn get(
+        &self,
+        dev: u64,
+        ino: u64,
+        mtime: std::time::SystemTime,
+        size: u64,
+    ) -> Option<String> {
         let read_txn = self.db.begin_read().ok()?;
         let table = read_txn.open_table(CACHE_TABLE).ok()?;
         let value = table.get((dev, ino)).ok()??;
         let (v_secs, v_nanos, v_size, v_hash) = value.value();
 
-        let duration = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).ok()?;
+        let duration = mtime
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .ok()?;
         if v_secs == duration.as_secs() && v_nanos == duration.subsec_nanos() && v_size == size {
             return Some(v_hash.to_string());
         }
         None
     }
 
-    pub fn set(&self, dev: u64, ino: u64, mtime: std::time::SystemTime, size: u64, hash: &str) -> Result<(), FdupsError> {
-        let write_txn = self.db.begin_write().map_err(|e: redb::TransactionError| FdupsError::Other(e.to_string()))?;
+    pub fn set(
+        &self,
+        dev: u64,
+        ino: u64,
+        mtime: std::time::SystemTime,
+        size: u64,
+        hash: &str,
+    ) -> Result<(), FdupsError> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e: redb::TransactionError| FdupsError::Other(e.to_string()))?;
         {
-            let mut table = write_txn.open_table(CACHE_TABLE).map_err(|e: redb::TableError| FdupsError::Other(e.to_string()))?;
-            let duration = mtime.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default();
-            table.insert((dev, ino), (duration.as_secs(), duration.subsec_nanos(), size, hash))
+            let mut table = write_txn
+                .open_table(CACHE_TABLE)
+                .map_err(|e: redb::TableError| FdupsError::Other(e.to_string()))?;
+            let duration = mtime
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            table
+                .insert(
+                    (dev, ino),
+                    (duration.as_secs(), duration.subsec_nanos(), size, hash),
+                )
                 .map_err(|e: redb::StorageError| FdupsError::Other(e.to_string()))?;
         }
-        write_txn.commit().map_err(|e: redb::CommitError| FdupsError::Other(e.to_string()))?;
+        write_txn
+            .commit()
+            .map_err(|e: redb::CommitError| FdupsError::Other(e.to_string()))?;
         Ok(())
     }
 }
@@ -141,7 +170,7 @@ pub const PARTIAL_HASH_SIZE: usize = 512;
 /// use fdups::find_remove_duplicates;
 ///
 /// let path = "/path/to/directory";
-/// let report = find_remove_duplicates(path, true, false, None).unwrap();
+/// let report = find_remove_duplicates(path, true, false, None, false).unwrap();
 ///
 /// println!("Found {} duplicates, saved {} bytes by deleting them", report.duplicate_count, report.size_saved_bytes);
 /// ```
@@ -151,6 +180,7 @@ pub fn find_remove_duplicates(
     delete: bool,
     dry_run: bool,
     cache_path: Option<&str>,
+    reflink: bool,
 ) -> Result<DuplicateReport, FdupsError> {
     let cache = if let Some(cp) = cache_path {
         Some(SignatureCache::open(cp)?)
@@ -168,7 +198,7 @@ pub fn find_remove_duplicates(
     let duplicates = find_duplicates_with_hasher_cache(potential_duplicates, cache.as_ref())?;
 
     debug!("Processing duplicates");
-    let (duplicate_count, size_saved) = process_duplicates(duplicates, delete, dry_run)?;
+    let (duplicate_count, size_saved) = process_duplicates(duplicates, delete, dry_run, reflink)?;
 
     info!(
         "Duplicate Ratio: {}/{} ({:.2}%)",
@@ -257,7 +287,10 @@ pub fn find_duplicates_with_hasher_cache(
                         return;
                     }
                     if let Ok(hash) = tail_hash_file(&file_entry.path) {
-                        tail_map.entry(hash).or_insert_with(Vec::new).push(file_entry);
+                        tail_map
+                            .entry(hash)
+                            .or_insert_with(Vec::new)
+                            .push(file_entry);
                     }
                 });
 
@@ -270,7 +303,10 @@ pub fn find_duplicates_with_hasher_cache(
                                 return;
                             }
                             if let Ok(full_hash) = full_hash_file(&file_entry, cache) {
-                                full_map.entry(full_hash).or_insert_with(Vec::new).push(file_entry);
+                                full_map
+                                    .entry(full_hash)
+                                    .or_insert_with(Vec::new)
+                                    .push(file_entry);
                             }
                         });
 
@@ -379,20 +415,31 @@ pub fn group_files_by_size(
                 }
             } else if metadata.is_file() {
                 if !visited_inodes.insert((dev, ino)) {
-                    debug!("Skipping hard link of already processed file: {}", path.display());
+                    debug!(
+                        "Skipping hard link of already processed file: {}",
+                        path.display()
+                    );
                     continue;
                 }
-                
+
                 total_files += 1;
                 pb.set_position(total_files as u64);
-                
+
                 let size = metadata.len();
-                let mtime = metadata.modified().unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
+                let mtime = metadata
+                    .modified()
+                    .unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
                 total_size_in_bytes += size as u128;
                 group_files_by_size
                     .entry(size)
                     .or_insert_with(Vec::new)
-                    .push(FileEntry { path, size, mtime, dev, ino });
+                    .push(FileEntry {
+                        path,
+                        size,
+                        mtime,
+                        dev,
+                        ino,
+                    });
             }
         }
 
@@ -401,9 +448,11 @@ pub fn group_files_by_size(
             if metadata.is_file() {
                 total_files += 1;
                 pb.set_position(total_files as u64);
-                
+
                 let size = metadata.len();
-                let mtime = metadata.modified().unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
+                let mtime = metadata
+                    .modified()
+                    .unwrap_or_else(|_| std::time::SystemTime::UNIX_EPOCH);
                 total_size_in_bytes += size as u128;
                 group_files_by_size
                     .entry(size)
@@ -447,9 +496,7 @@ pub fn group_files_by_size(
 /// assert_eq!(potential.len(), 2);
 ///```
 #[must_use]
-pub fn find_potential_duplicates(
-    files_by_size: HashMap<u64, Vec<FileEntry>>,
-) -> Vec<FileEntry> {
+pub fn find_potential_duplicates(files_by_size: HashMap<u64, Vec<FileEntry>>) -> Vec<FileEntry> {
     let mut potential_duplicates = Vec::new();
     // Iterate through the hash map and add the files to the vector if there's more than one file with the same size
     for (_size, files) in files_by_size {
@@ -476,6 +523,9 @@ macro_rules! print_filepath {
     ( $arg:expr,dry_run ) => {{
         println!("\t- {} [Deleted] [Dry Run]", $arg.display());
     }};
+    ( $arg:expr,reflinked ) => {{
+        println!("\t- {} [Reflinked]", $arg.display());
+    }};
 }
 /// Processes the detected duplicates and removes them if delete flag is set.
 ///
@@ -501,7 +551,7 @@ macro_rules! print_filepath {
 ///     files.push(FileEntry { path: PathBuf::from("file2.txt"), size: 10, mtime: now, dev: 0, ino: 0 });
 ///     let mut duplicates = HashMap::new();
 ///     duplicates.insert("hash1".to_string(), files);
-///     let (count, size) = process_duplicates(duplicates, false, false)?;
+///     let (count, size) = process_duplicates(duplicates, false, false, false)?;
 ///     assert_eq!(count, 1);
 ///     assert!(size > 0);
 ///     Ok(())
@@ -511,6 +561,7 @@ pub fn process_duplicates(
     duplicates: HashMap<String, Vec<FileEntry>>,
     delete: bool,
     dry_run: bool,
+    reflink_requested: bool,
 ) -> Result<(u128, u128), FdupsError> {
     // Define variables to keep track of the number of duplicates and amount of disk space saved
     let mut duplicate_count: u128 = 0;
@@ -539,21 +590,46 @@ pub fn process_duplicates(
                     // Liveness check: ensure file hasn't changed since initial scan
                     match metadata(&entry.path) {
                         Ok(current_meta) => {
-                            let current_mtime = current_meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            let current_mtime = current_meta
+                                .modified()
+                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                             if current_meta.len() != entry.size || current_mtime != entry.mtime {
-                                warn!("File {} changed since scan, skipping for safety.", entry.path.display());
+                                warn!(
+                                    "File {} changed since scan, skipping for safety.",
+                                    entry.path.display()
+                                );
                                 continue;
                             }
                         }
                         Err(e) => {
-                            warn!("Could not verify liveness for {}, skipping: {}", entry.path.display(), e);
+                            warn!(
+                                "Could not verify liveness for {}, skipping: {}",
+                                entry.path.display(),
+                                e
+                            );
                             continue;
+                        }
+                    }
+
+                    // If reflink is requested, try to reflink from the original
+                    if reflink_requested && !dry_run {
+                        let original_path = &files[0].path;
+                        match reflink::reflink(original_path, &entry.path) {
+                            Ok(_) => {
+                                print_filepath!(entry.path, reflinked);
+                                duplicate_count += 1;
+                                size_saved += entry.size as u128;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("Reflink failed for {}: {}. Falling back to default behavior.", entry.path.display(), e);
+                            }
                         }
                     }
 
                     duplicate_count += 1;
                     size_saved += entry.size as u128;
-                    
+
                     // If delete is true, delete the file
                     if delete {
                         if dry_run {
@@ -599,19 +675,16 @@ pub fn process_duplicates(
 /// use std::path::PathBuf;
 /// use fdups::{full_hash_file, FileEntry};
 ///
-/// let entry = FileEntry { 
-///     path: PathBuf::from("file.txt"), 
-///     size: 100, 
-///     mtime: std::time::SystemTime::now(), 
-///     dev: 0, 
-///     ino: 0 
+/// let entry = FileEntry {
+///     path: PathBuf::from("file.txt"),
+///     size: 100,
+///     mtime: std::time::SystemTime::now(),
+///     dev: 0,
+///     ino: 0
 /// };
 /// let hash_result = full_hash_file(&entry, None);
 /// ```
-pub fn full_hash_file(
-    entry: &FileEntry,
-    cache: Option<&SignatureCache>,
-) -> io::Result<String> {
+pub fn full_hash_file(entry: &FileEntry, cache: Option<&SignatureCache>) -> io::Result<String> {
     if let Some(c) = cache {
         if let Some(h) = c.get(entry.dev, entry.ino, entry.mtime, entry.size) {
             return Ok(h);
@@ -624,15 +697,29 @@ pub fn full_hash_file(
 
     let hash_str = if len > 1_048_576 {
         unsafe {
-            let mmap = Mmap::map(&file)?;
+            let mut hasher = blake3::Hasher::new();
+            
             #[cfg(target_os = "linux")]
-            libc::posix_fadvise(
-                file.as_raw_fd(),
-                0,
-                len as libc::off_t,
-                libc::POSIX_FADV_SEQUENTIAL,
-            );
-            blake3::hash(&mmap).to_hex().to_string()
+            {
+                // Sparse file optimization: skip hashing holes
+                if let Ok(hash) = hash_sparse_file(&file, &mut hasher) {
+                    hash
+                } else {
+                    let mmap = Mmap::map(&file)?;
+                    libc::posix_fadvise(
+                        file.as_raw_fd(),
+                        0,
+                        len as libc::off_t,
+                        libc::POSIX_FADV_SEQUENTIAL,
+                    );
+                    blake3::hash(&mmap).to_hex().to_string()
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let mmap = Mmap::map(&file)?;
+                blake3::hash(&mmap).to_hex().to_string()
+            }
         }
     } else {
         let mut reader = BufReader::new(file);
@@ -654,6 +741,60 @@ pub fn full_hash_file(
     }
 
     Ok(hash_str)
+}
+
+#[cfg(target_os = "linux")]
+fn hash_sparse_file(file: &File, hasher: &mut blake3::Hasher) -> io::Result<String> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let mut curr: i64 = 0;
+    let size = file.metadata()?.len() as i64;
+    let mut buffer = [0u8; BUFFER_SIZE];
+
+    while curr < size {
+        let data_start = unsafe { libc::lseek(fd, curr, libc::SEEK_DATA) };
+        if data_start == -1 {
+            let remaining = size - curr;
+            if remaining > 0 {
+                let mut left = remaining;
+                let zeros = [0u8; BUFFER_SIZE];
+                while left > 0 {
+                    let to_write = std::cmp::min(left as usize, BUFFER_SIZE);
+                    hasher.update(&zeros[..to_write]);
+                    left -= to_write as i64;
+                }
+            }
+            break;
+        }
+
+        if data_start > curr {
+            let mut left = data_start - curr;
+            let zeros = [0u8; BUFFER_SIZE];
+            while left > 0 {
+                let to_write = std::cmp::min(left as usize, BUFFER_SIZE);
+                hasher.update(&zeros[..to_write]);
+                left -= to_write as i64;
+            }
+        }
+
+        let hole_start = unsafe { libc::lseek(fd, data_start, libc::SEEK_HOLE) };
+        let data_end = if hole_start == -1 { size } else { hole_start };
+
+        let data_len = data_end - data_start;
+        let mut file_clone = file.try_clone()?;
+        file_clone.seek(io::SeekFrom::Start(data_start as u64))?;
+        let mut left = data_len;
+        while left > 0 {
+            let to_read = std::cmp::min(left as usize, BUFFER_SIZE);
+            let n = file_clone.read(&mut buffer[..to_read])?;
+            if n == 0 { break; }
+            hasher.update(&buffer[..n]);
+            left -= n as i64;
+        }
+
+        curr = data_end;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 // ============================================================================
@@ -684,7 +825,7 @@ mod tests {
         let (dev, ino) = (meta.dev(), meta.ino());
         #[cfg(not(unix))]
         let (dev, ino) = (0, 0);
-        
+
         FileEntry {
             path,
             size: meta.len(),
@@ -709,8 +850,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut content1 = vec![0x41; 8192]; // 'A'
         let mut content2 = vec![0x41; 8192]; // 'A'
-        // Same first 4096 bytes
-        // Different bytes after 4096
+                                             // Same first 4096 bytes
+                                             // Different bytes after 4096
         content2[4097] = 0x42; // 'B'
 
         let file1 = create_test_file(&dir, "head1.dat", &content1);
@@ -829,9 +970,15 @@ mod tests {
         let file2 = create_test_file(&dir, "f2.dat", &content2);
 
         // Heads are same (all zeros)
-        assert_eq!(partial_hash_file(&file1).unwrap(), partial_hash_file(&file2).unwrap());
+        assert_eq!(
+            partial_hash_file(&file1).unwrap(),
+            partial_hash_file(&file2).unwrap()
+        );
         // Tails are different
-        assert_ne!(tail_hash_file(&file1).unwrap(), tail_hash_file(&file2).unwrap());
+        assert_ne!(
+            tail_hash_file(&file1).unwrap(),
+            tail_hash_file(&file2).unwrap()
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -914,8 +1061,20 @@ mod tests {
         files_by_size.insert(
             200,
             vec![
-                FileEntry { path: dup1.clone(), size: 200, mtime: std::time::SystemTime::now(), dev: 0, ino: 0 },
-                FileEntry { path: dup2.clone(), size: 200, mtime: std::time::SystemTime::now(), dev: 0, ino: 0 },
+                FileEntry {
+                    path: dup1.clone(),
+                    size: 200,
+                    mtime: std::time::SystemTime::now(),
+                    dev: 0,
+                    ino: 0,
+                },
+                FileEntry {
+                    path: dup2.clone(),
+                    size: 200,
+                    mtime: std::time::SystemTime::now(),
+                    dev: 0,
+                    ino: 0,
+                },
             ],
         );
 
@@ -944,7 +1103,13 @@ mod tests {
             let path = PathBuf::from(format!("/path/file{}.txt", i));
             files_by_size.insert(
                 i as u64 * 100,
-                vec![FileEntry { path, size: i as u64 * 100, mtime: std::time::SystemTime::now(), dev: 0, ino: 0 }],
+                vec![FileEntry {
+                    path,
+                    size: i as u64 * 100,
+                    mtime: std::time::SystemTime::now(),
+                    dev: 0,
+                    ino: 0,
+                }],
             );
         }
 
@@ -971,7 +1136,7 @@ mod tests {
         let potential = vec![
             create_file_entry(file1.clone()),
             create_file_entry(file2.clone()),
-            create_file_entry(file3.clone())
+            create_file_entry(file3.clone()),
         ];
         let duplicates = find_duplicates_with_hasher_cache(potential, None).unwrap();
 
@@ -1018,7 +1183,7 @@ mod tests {
 
         let potential = vec![
             create_file_entry(file1.clone()),
-            create_file_entry(file2.clone())
+            create_file_entry(file2.clone()),
         ];
         let duplicates = find_duplicates_with_hasher_cache(potential, None).unwrap();
 
@@ -1077,11 +1242,11 @@ mod tests {
             vec![
                 create_file_entry(file1.clone()),
                 create_file_entry(file2.clone()),
-                create_file_entry(file3.clone())
+                create_file_entry(file3.clone()),
             ],
         );
 
-        let (count, size_saved) = process_duplicates(duplicates, false, false).unwrap();
+        let (count, size_saved) = process_duplicates(duplicates, false, false, false).unwrap();
 
         // 3 files with same hash = 2 duplicates
         assert_eq!(count, 2, "Should report 2 duplicates");
@@ -1106,11 +1271,11 @@ mod tests {
             "hash456".to_string(),
             vec![
                 create_file_entry(file1.clone()),
-                create_file_entry(file2.clone())
-            ]
+                create_file_entry(file2.clone()),
+            ],
         );
 
-        let (count, _) = process_duplicates(duplicates, true, false).unwrap();
+        let (count, _) = process_duplicates(duplicates, true, false, false).unwrap();
 
         assert_eq!(count, 1, "Should report 1 duplicate");
         // The oldest file (first created) should be kept
@@ -1125,7 +1290,7 @@ mod tests {
     #[test]
     fn test_process_duplicates_no_duplicates() {
         let duplicates: HashMap<String, Vec<FileEntry>> = HashMap::new();
-        let (count, size_saved) = process_duplicates(duplicates, false, false).unwrap();
+        let (count, size_saved) = process_duplicates(duplicates, false, false, false).unwrap();
 
         assert_eq!(count, 0);
         assert_eq!(size_saved, 0);
