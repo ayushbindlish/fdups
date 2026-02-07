@@ -28,6 +28,8 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use term_size::dimensions;
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
@@ -454,7 +456,18 @@ pub fn find_duplicates_with_hasher_cache(
 /// Create a partial_hash_file function (Head Hash, 4KB)
 pub fn partial_hash_file(file_path: &std::path::Path) -> io::Result<String> {
     let mut file = File::open(file_path)?;
-    let mut buffer = [0; 4096];
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut buffer = vec![0u8; 4096];
+        // Try io_uring first
+        if let Ok(n) = io_uring_read_at(&file, &mut buffer, 0) {
+             return Ok(blake3::hash(&buffer[..n]).to_hex().to_string());
+        }
+    }
+
+    // Fallback or non-linux default
+    let mut buffer = [0u8; 4096];
     let n = file.read(&mut buffer)?;
     Ok(blake3::hash(&buffer[..n]).to_hex().to_string())
 }
@@ -466,8 +479,18 @@ pub fn tail_hash_file(file_path: &std::path::Path) -> io::Result<String> {
     if len <= 4096 {
         return partial_hash_file(file_path);
     }
+
+    #[cfg(target_os = "linux")]
+    {
+        let offset = len - 4096;
+        let mut buffer = vec![0u8; 4096];
+        if let Ok(n) = io_uring_read_at(&file, &mut buffer, offset) {
+             return Ok(blake3::hash(&buffer[..n]).to_hex().to_string());
+        }
+    }
+
     file.seek(SeekFrom::End(-4096))?;
-    let mut buffer = [0; 4096];
+    let mut buffer = [0u8; 4096];
     let n = file.read(&mut buffer)?;
     Ok(blake3::hash(&buffer[..n]).to_hex().to_string())
 }
@@ -1097,6 +1120,34 @@ fn sort_by_physical_location(entries: &mut Vec<FileEntry>) {
 // ============================================================================
 // UNIT TESTS
 // ============================================================================
+// ============================================================================
+// IO_URING INTEGRATION
+// ============================================================================
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static RIO: RefCell<Option<rio::Rio>> = RefCell::new(None);
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_read_at(file: &File, buf: &mut Vec<u8>, offset: u64) -> io::Result<usize> {
+    RIO.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        
+        // Initialize Rio if needed
+        if borrow.is_none() {
+             match rio::new() {
+                Ok(r) => *borrow = Some(r),
+                Err(e) => return Err(e),
+             }
+        }
+        
+        // At this point borrow is Some(Rio)
+        let rio = borrow.as_ref().unwrap();
+        pollster::block_on(rio.read_at(file, buf, offset))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
